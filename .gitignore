@@ -42,3 +42,7 @@ old/
 Manifests/
 main03.py
 main03 imac.py
+
+# Local scratch / docs not for repo
+.reaper_api_doc.html
+temp.py
