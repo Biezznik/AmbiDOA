@@ -1,0 +1,44 @@
+# OS / filesystem noise
+._*
+.DS_Store
+Thumbs.db
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+macvenv/
+.venv311/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Training artifacts
+Logs/
+models/
+*.ckpt
+*.pth
+*.pt
+
+# Legacy local-only folders from prior ignore list
+bnc02/
+media/
+
+# User-requested exclusions for AmbiDOA repo scope
+noise01/
+noise02/
+snapshot_pre_lightning_2026_02_26_135843/
+old/
+Manifests/
+main03.py
+main03 imac.py
