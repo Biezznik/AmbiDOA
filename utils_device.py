@@ -1,22 +1,23 @@
 import torch
 
+
 def pick_device(prefer_cuda: bool = True):
     """
-    Zwraca (torch.device, use_amp) z sensownymi ustawieniami backendu.
-    - CUDA: włącza TF32 i benchmark dla cuDNN; AMP -> True (float16).
-    - MPS: AMP wyłączone (zwykle brak korzyści/stabilności), wszystko w fp32.
-    - CPU: AMP wyłączone.
+    Return (torch.device, use_amp) with practical backend defaults.
+    - CUDA: enable TF32 and cuDNN benchmark; AMP enabled (float16).
+    - MPS: AMP disabled (typically limited benefit/stability), fp32 path.
+    - CPU: AMP disabled.
     """
     if prefer_cuda and torch.cuda.is_available():
         device = torch.device("cuda")
-        use_amp = True  # mixed precision dla GPU NVIDII
-        # Drobne tuningi wydajności
+        use_amp = True  # mixed precision for NVIDIA GPUs
+        # Small performance tuning defaults.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True  # jeśli stała długość wejścia/batch
+        torch.backends.cudnn.benchmark = True  # best when input shape is stable
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         device = torch.device("mps")
-        use_amp = False  # na MPS zwykle trzymaj fp32
+        use_amp = False  # keep fp32 on MPS by default
     else:
         device = torch.device("cpu")
         use_amp = False
@@ -25,9 +26,9 @@ def pick_device(prefer_cuda: bool = True):
 
 def dataloader_kwargs_for(device, num_workers: int = 8):
     """
-    Sensowne ustawienia DataLoadera per backend.
-    - pin_memory: tylko dla CUDA (szybsze kopiowanie host->GPU).
-    - persistent_workers: True, jeśli num_workers>0 (szybsze powtórne epoki).
+    Build DataLoader kwargs per backend.
+    - pin_memory: only for CUDA (faster host->GPU transfer).
+    - persistent_workers: True when num_workers>0 (faster between epochs).
     """
     # Accept both torch.device and string forms ("cuda", "cuda:0", "mps", "cpu").
     device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]

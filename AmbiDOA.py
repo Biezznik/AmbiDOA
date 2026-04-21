@@ -35,10 +35,10 @@ def _extract_model_state(d):
     for k in ['state_dict', 'model_state_dict', 'model', 'net', 'weights']:
         if isinstance(d, dict) and k in d and isinstance(d[k], dict):
             return d[k]
-    # gdy zapisano surowe state_dict
+    # Fallback when checkpoint stores a raw state_dict directly.
     if isinstance(d, dict):
         return d
-    raise ValueError("Nie rozpoznano formatu checkpointu (brak state_dict).")
+    raise ValueError("Unsupported checkpoint format (missing state_dict).")
 
 def _extract_optimizer_state(d):
     for k in ["optimizer_state_dict", "optimizer", "optim_state_dict", "optimizer_state"]:
