@@ -10,14 +10,27 @@ composition from the non-Lightning pipeline:
 6. Optional scheduler step (per iteration).
 
 Keeping this sequence explicit makes migration safer and easier to audit.
+
+Additional regularization supported:
+- Mean Teacher: EMA model acts as a teacher during training. A position-only
+  consistency loss between student and teacher predictions is added to the
+  task loss.
+- R-Drop: Two student forward passes with different dropout masks are compared.
+  A position-only consistency loss between the two outputs is added to the
+  task loss.
+
+Both consistency losses are restricted to the position head — applying MSE
+consistency on the scalar count head collapses it toward the dataset-mean count.
 """
 
+import copy
 import sys
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
 import torch
+import torch.nn.functional as F
 
 try:
     import lightning.pytorch as pl
@@ -31,7 +44,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model import AmbiTransformerDOA
-from train_utils import angular_error_stats_PI, build_warmup_cosine_scheduler, multi_source_loss
+from train_utils import (
+    angular_error_stats_PI,
+    build_warmup_cosine_scheduler,
+    multi_source_loss,
+    position_consistency_count_loss,
+)
 
 
 class AmbiDOALightningModule(pl.LightningModule):
@@ -53,6 +71,10 @@ class AmbiDOALightningModule(pl.LightningModule):
         lambda_count=0.1,
         lambda_pos=2.5,
         pos_loss_type="cosine",
+        count_label_smoothing=0.0,
+        count_consistency_weight=0.0,
+        count_consistency_cos_threshold=0.5,
+        count_per_k_weights=None,
         use_scheduler=True,
         weight_decay=0.0,
         warmup_steps=None,
@@ -62,6 +84,9 @@ class AmbiDOALightningModule(pl.LightningModule):
         use_ema=False,
         ema_decay=0.999,
         ema_update_after_step=0,
+        mean_teacher_weight=0.0,
+        rdrop_weight=0.0,
+        regularization_every_n_steps=1,
         log_timing=False,
         timing_log_every_n_steps=0,
         timing_cuda_sync=False,
@@ -80,9 +105,14 @@ class AmbiDOALightningModule(pl.LightningModule):
             max_sources=12,
             use_posenc=True,
             dropout=0.003,
+            stochastic_depth=0.0,
+            count_loss_type=str(count_loss_type),
+            count_head_hidden=True,
         )
         if model_kwargs:
             model_defaults.update(model_kwargs)
+        # Ensure model's count head matches the loss type (kwargs may override default).
+        model_defaults["count_loss_type"] = str(count_loss_type)
 
         # Core AmbiDOA transformer model.
         self.model = AmbiTransformerDOA(**model_defaults)
@@ -93,6 +123,35 @@ class AmbiDOALightningModule(pl.LightningModule):
         self.lambda_count = float(lambda_count)
         self.lambda_pos = float(lambda_pos)
         self.pos_loss_type = pos_loss_type
+        self.count_label_smoothing = float(count_label_smoothing)
+        self.count_consistency_weight = float(count_consistency_weight)
+        self.count_consistency_cos_threshold = float(count_consistency_cos_threshold)
+
+        # Optional per-k class balance weights for the ordinal count BCE.
+        # Registered as a non-persistent buffer so it follows the module across
+        # devices without polluting checkpoints; None => baseline (no reweighting).
+        if count_per_k_weights is not None:
+            weights_list = [float(w) for w in count_per_k_weights]
+            expected_len = int(model_defaults["max_sources"]) + 1
+            if len(weights_list) != expected_len:
+                raise ValueError(
+                    f"count_per_k_weights must have length max_sources + 1 = {expected_len}, "
+                    f"got {len(weights_list)}."
+                )
+            if any(w < 0.0 for w in weights_list):
+                raise ValueError("count_per_k_weights entries must be non-negative.")
+            if self.count_loss_type != "ordinal":
+                raise ValueError(
+                    "count_per_k_weights is only meaningful in 'ordinal' mode; "
+                    "leave it null/omitted for 'regression' or 'presence'."
+                )
+            self.register_buffer(
+                "count_per_k_weights",
+                torch.tensor(weights_list, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.count_per_k_weights = None
         self.use_scheduler = bool(use_scheduler)
         self.weight_decay = float(weight_decay)
         self.warmup_steps = warmup_steps
@@ -102,6 +161,9 @@ class AmbiDOALightningModule(pl.LightningModule):
         self.use_ema = bool(use_ema)
         self.ema_decay = float(ema_decay)
         self.ema_update_after_step = max(0, int(ema_update_after_step))
+        self.mean_teacher_weight = float(mean_teacher_weight)
+        self.rdrop_weight = float(rdrop_weight)
+        self.regularization_every_n_steps = max(1, int(regularization_every_n_steps))
         self.log_timing = bool(log_timing)
         self.timing_log_every_n_steps = max(0, int(timing_log_every_n_steps))
         self.timing_cuda_sync = bool(timing_cuda_sync)
@@ -111,11 +173,29 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         if not (0.0 < self.ema_decay < 1.0):
             raise ValueError("ema_decay must be in (0, 1).")
-        if self.count_loss_type != "regression":
+        if self.count_loss_type not in ("regression", "ordinal", "presence"):
             raise ValueError(
                 f"Unsupported count_loss_type='{self.count_loss_type}'. "
-                "Current AmbiDOA count head supports only 'regression'."
+                "Expected 'regression', 'ordinal', or 'presence'."
             )
+        if not (0.0 <= self.count_label_smoothing < 0.5):
+            raise ValueError("count_label_smoothing must be in [0.0, 0.5).")
+        if self.count_consistency_weight < 0.0:
+            raise ValueError("count_consistency_weight must be >= 0.")
+        if not (-1.0 <= self.count_consistency_cos_threshold <= 1.0):
+            raise ValueError("count_consistency_cos_threshold must be in [-1.0, 1.0].")
+        if self.count_label_smoothing > 0 and self.count_loss_type not in ("ordinal", "presence"):
+            raise ValueError(
+                "count_label_smoothing > 0 is only meaningful in 'ordinal' or 'presence' mode; "
+                "set it to 0.0 for 'regression'."
+            )
+        if self.count_loss_type == "presence" and self.count_consistency_weight > 0:
+            raise ValueError(
+                "count_consistency_weight is undefined in 'presence' mode; the presence head "
+                "does not produce a monotone count-distribution to be smoothed. Set it to 0.0."
+            )
+        if self.mean_teacher_weight > 0 and not self.use_ema:
+            raise ValueError("mean_teacher_weight > 0 requires use_ema=True.")
 
         # Use manual optimization to mirror the original training loop order:
         # zero_grad -> forward -> PI/Hungarian loss -> backward -> clip -> step -> scheduler.step
@@ -144,10 +224,10 @@ class AmbiDOALightningModule(pl.LightningModule):
         self._val_step_time_count = 0
         self._val_step_ms_epoch = None
 
-        # EMA shadow and swap state (optional).
-        self._ema_state = {}
-        self._ema_backup = None
-        self._using_ema_weights = False
+        # EMA teacher model — created in on_fit_start so it inherits pretrained weights.
+        # Auto-registered as a child nn.Module by __setattr__; train() override below
+        # keeps it permanently in eval so dropout/etc. don't activate in the teacher.
+        self._ema_model = None
 
         # Save hyperparameters for checkpoint reproducibility and experiment traceability.
         self.save_hyperparameters()
@@ -155,6 +235,19 @@ class AmbiDOALightningModule(pl.LightningModule):
     def forward(self, x):
         """Forward proxy to keep Lightning and plain PyTorch usage aligned."""
         return self.model(x)
+
+    def train(self, mode=True):
+        """Force EMA teacher to remain in eval mode whenever the module is toggled.
+
+        Lightning calls `.train(True)` between validation and training epochs;
+        without this override the recursion would flip the EMA submodule into
+        train mode, activating dropout in the teacher and corrupting the
+        mean-teacher consistency target.
+        """
+        super().train(mode)
+        if self._ema_model is not None:
+            self._ema_model.eval()
+        return self
 
     def _resolve_run_txt_log_path(self):
         if self._run_txt_log_path is not None:
@@ -217,68 +310,80 @@ class AmbiDOALightningModule(pl.LightningModule):
             total += g.pow(2).sum()
         return float(torch.sqrt(total).detach().cpu().item())
 
-    def _init_ema_state(self):
-        """Initialize EMA shadow with current model parameters."""
-        self._ema_state = {
-            name: p.detach().clone()
-            for name, p in self.model.named_parameters()
-        }
+    # -------------------------------------------------------------------------
+    # EMA model management
+    # -------------------------------------------------------------------------
+
+    def _init_ema_model(self):
+        """Create EMA teacher as a detached copy of the current student weights.
+
+        Called in on_fit_start so the teacher starts from the same weights as
+        the student — including any pretrained weights loaded before training.
+        """
+        self._ema_model = copy.deepcopy(self.model)
+        for p in self._ema_model.parameters():
+            p.requires_grad_(False)
+        self._ema_model.eval()
+        self._ema_model.to(self.device)
 
     @torch.no_grad()
     def _update_ema(self):
-        """Update EMA shadow after optimizer step."""
-        if not self.use_ema or not self._ema_state:
+        """Update EMA teacher parameters after each optimizer step."""
+        if not self.use_ema or self._ema_model is None:
             return
         decay = self.ema_decay
         one_minus = 1.0 - decay
-        for name, p in self.model.named_parameters():
-            ema_t = self._ema_state.get(name)
-            if ema_t is None:
-                self._ema_state[name] = p.detach().clone()
-                continue
-            ema_t.mul_(decay).add_(p.detach(), alpha=one_minus)
-
-    @torch.no_grad()
-    def _swap_model_to_ema(self):
-        """Swap model parameters to EMA weights for validation/checkpointing."""
-        if (
-            not self.use_ema
-            or self._using_ema_weights
-            or not self._ema_state
+        for ema_p, model_p in zip(
+            self._ema_model.parameters(), self.model.parameters()
         ):
-            return
-        self._ema_backup = {
-            name: p.detach().clone()
-            for name, p in self.model.named_parameters()
-        }
-        for name, p in self.model.named_parameters():
-            p.data.copy_(self._ema_state[name])
-        self._using_ema_weights = True
+            ema_p.data.mul_(decay).add_(model_p.data, alpha=one_minus)
 
-    @torch.no_grad()
-    def _restore_model_from_ema(self):
-        """Restore non-EMA training weights after validation phase."""
-        if not self._using_ema_weights or self._ema_backup is None:
-            return
-        for name, p in self.model.named_parameters():
-            p.data.copy_(self._ema_backup[name])
-        self._ema_backup = None
-        self._using_ema_weights = False
+    # -------------------------------------------------------------------------
+    # Consistency losses
+    # -------------------------------------------------------------------------
+
+    def _mean_teacher_loss(self, pred_count, pred_pos, x_batch):
+        """Consistency loss between student and EMA teacher predictions.
+
+        Applied to the position head only. Count is intentionally excluded:
+        MSE consistency on a scalar regression drives the prediction toward
+        its mean under perturbation, which collapses the count head onto the
+        dataset-mean count. Position is a direction vector where consistency
+        is informative.
+        """
+        with torch.no_grad():
+            _, t_pos = self._ema_model(x_batch)
+        return (1.0 - (pred_pos * t_pos).sum(dim=-1)).mean()
+
+    def _rdrop_loss(self, pred_count, pred_pos, x_batch):
+        """Consistency loss between two student forward passes with different dropout masks.
+
+        Runs a second forward pass and penalizes deviation from the first
+        position output. Gradients flow through both passes — neither output
+        is detached. Count is excluded for the same reason as in
+        _mean_teacher_loss: MSE consistency on a scalar regresses toward the
+        mean instead of sharpening the prediction.
+        """
+        _, pred_pos2 = self.model(x_batch)
+        return (1.0 - (pred_pos * pred_pos2).sum(dim=-1)).mean()
+
+    # -------------------------------------------------------------------------
+    # Lightning hooks
+    # -------------------------------------------------------------------------
 
     def on_fit_start(self):
-        """Initialize EMA shadow at fit start if requested."""
+        """Create EMA teacher at fit start, after pretrained weights are in place."""
         if self.use_ema:
-            self._init_ema_state()
+            self._init_ema_model()
 
     def on_train_epoch_start(self):
-        """Reset manual-optimization telemetry and restore train weights if needed."""
+        """Reset manual-optimization telemetry at the start of each training epoch."""
         self._train_optimizer_steps_epoch = 0
         self._train_grad_norm_sum = 0.0
         self._train_grad_norm_count = 0
         self._train_clip_events = 0
         self._train_step_time_sum = 0.0
         self._train_step_time_count = 0
-        self._restore_model_from_ema()
 
     def _reset_validation_accumulators(self):
         """Prepare lightweight running statistics for epoch-level validation metrics."""
@@ -299,8 +404,15 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         Manual optimization is used on purpose to keep scheduler stepping and
         gradient flow identical to the previous custom training utility.
+
+        Loss composition (when regularizers are enabled):
+          combined_loss = task_loss
+                        + mean_teacher_weight * mt_loss
+                        + rdrop_weight * rdrop_loss
+
+        train/loss logs the combined loss (the actual gradient target).
+        train/base_loss logs the task loss only — directly comparable to val_loss.
         """
-        # Retrieve optimizer from Lightning (single optimizer expected).
         t0 = perf_counter() if self.log_timing else None
         opt = self.optimizers()
         if isinstance(opt, (list, tuple)):
@@ -311,13 +423,13 @@ class AmbiDOALightningModule(pl.LightningModule):
         if batch_idx % self.grad_accum_steps == 0:
             opt.zero_grad(set_to_none=True)
 
-        # Forward pass: predict source count and source positions.
+        # --- Student forward pass 1 ---
         pred_count, pred_pos = self.model(x_batch)
 
-        # Compute combined multi-source loss:
-        # - count component
-        # - position component with permutation-invariant Hungarian matching.
-        total_loss, loss_cnt, loss_pos = multi_source_loss(
+        # --- Task loss (count + PI position) ---
+        # Also receive the PI match indices so the consistency aux loss can reuse
+        # them — avoids a second Hungarian solve per training step.
+        total_loss, loss_cnt, loss_pos, match_idx_batch = multi_source_loss(
             pred_count,
             y_count,
             pred_pos,
@@ -327,11 +439,48 @@ class AmbiDOALightningModule(pl.LightningModule):
             lambda_count=self.lambda_count,
             lambda_pos=self.lambda_pos,
             pos_loss_type=self.pos_loss_type,
+            count_label_smoothing=self.count_label_smoothing,
+            count_per_k_weights=self.count_per_k_weights,
             return_components=True,
+            return_matches=True,
+        )
+
+        # --- Mean Teacher and R-Drop (applied every N steps to reduce compute) ---
+        apply_regularization = (batch_idx % self.regularization_every_n_steps == 0)
+
+        mt_loss = pred_count.new_tensor(0.0)
+        if apply_regularization and self.mean_teacher_weight > 0 and self._ema_model is not None:
+            mt_loss = self._mean_teacher_loss(pred_count, pred_pos, x_batch)
+
+        rdrop_loss = pred_count.new_tensor(0.0)
+        if apply_regularization and self.rdrop_weight > 0:
+            rdrop_loss = self._rdrop_loss(pred_count, pred_pos, x_batch)
+
+        # --- Count-from-positions consistency (Strategy #3) ---
+        # Ties pred_count to the number of well-localized matched slots so the
+        # count head can't claim sources the position head has not localized.
+        cc_loss = pred_count.new_tensor(0.0)
+        if self.count_consistency_weight > 0:
+            cc_loss = position_consistency_count_loss(
+                pred_count,
+                pred_pos,
+                y_pos,
+                mask,
+                count_loss_type=self.count_loss_type,
+                match_idx_batch=match_idx_batch,
+                cos_threshold=self.count_consistency_cos_threshold,
+            )
+
+        # --- Combined loss for backward ---
+        combined_loss = (
+            total_loss
+            + self.mean_teacher_weight * mt_loss
+            + self.rdrop_weight * rdrop_loss
+            + self.count_consistency_weight * cc_loss
         )
 
         # Backpropagate scaled loss so effective gradient matches larger batch.
-        scaled_loss = total_loss / float(self.grad_accum_steps)
+        scaled_loss = combined_loss / float(self.grad_accum_steps)
         self.manual_backward(scaled_loss)
 
         # Flush optimizer step on accumulation boundary or last batch in epoch.
@@ -374,12 +523,20 @@ class AmbiDOALightningModule(pl.LightningModule):
             if self.use_ema and self._optimizer_step_count_total >= self.ema_update_after_step:
                 self._update_ema()
 
-        # Training logs are emitted per-step and aggregated per-epoch.
-        # This keeps live monitoring responsive while preserving epoch summaries.
+        # --- Logging ---
+        # train/loss = combined loss (actual gradient target, includes mt + rdrop).
+        # train/base_loss = task loss only — apples-to-apples with val_loss.
         batch_size = x_batch.size(0)
-        self.log("train/loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log("train/loss", combined_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log("train/base_loss", total_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         self.log("train/loss_count", loss_cnt, on_step=True, on_epoch=True, batch_size=batch_size)
         self.log("train/loss_pos", loss_pos, on_step=True, on_epoch=True, batch_size=batch_size)
+        if self.mean_teacher_weight > 0:
+            self.log("train/loss_mt", mt_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+        if self.rdrop_weight > 0:
+            self.log("train/loss_rdrop", rdrop_loss, on_step=True, on_epoch=True, batch_size=batch_size)
+        if self.count_consistency_weight > 0:
+            self.log("train/loss_cc", cc_loss, on_step=True, on_epoch=True, batch_size=batch_size)
 
         if self.log_timing and t0 is not None:
             if self.timing_cuda_sync and self.device.type == "cuda":
@@ -394,19 +551,25 @@ class AmbiDOALightningModule(pl.LightningModule):
         return total_loss
 
     def on_validation_epoch_start(self):
-        """Reset validation accumulators and swap to EMA weights if enabled."""
-        if self.use_ema:
-            self._swap_model_to_ema()
+        """Reset validation accumulators at the start of each validation epoch."""
         self._reset_validation_accumulators()
         self._val_step_time_sum = 0.0
         self._val_step_time_count = 0
         self._val_step_ms_epoch = None
 
     def validation_step(self, batch, batch_idx):
-        """Validation batch pass without optimization."""
+        """Validation batch pass without optimization.
+
+        Uses EMA teacher weights when available — same weights that were used
+        during the last training step's teacher forward — without the overhead
+        of weight swapping into self.model.
+        """
         t0 = perf_counter() if self.log_timing else None
         x_val, y_count, mask, y_pos = batch
-        pred_count, pred_pos = self.model(x_val)
+
+        # Evaluate with EMA teacher when available; fall back to student model.
+        eval_model = self._ema_model if (self.use_ema and self._ema_model is not None) else self.model
+        pred_count, pred_pos = eval_model(x_val)
 
         # Keep loss function identical to training for consistent model selection.
         loss, loss_cnt, loss_pos = multi_source_loss(
@@ -419,6 +582,8 @@ class AmbiDOALightningModule(pl.LightningModule):
             lambda_count=self.lambda_count,
             lambda_pos=self.lambda_pos,
             pos_loss_type=self.pos_loss_type,
+            count_label_smoothing=self.count_label_smoothing,
+            count_per_k_weights=self.count_per_k_weights,
             return_components=True,
         )
 
@@ -431,8 +596,17 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         max_sources = int(self.model.max_sources)
 
+        # Collapse per-slot logits to a scalar predicted count before metrics so
+        # the downstream histogram / per-k aggregation code stays identical.
+        # Ordinal:  k_pred = sum_j 1{ sigmoid(cum_logit_j) > 0.5 } (cumulative P(k>=j)).
+        # Presence: k_pred = sum_j 1{ sigmoid(slot_logit_j) > 0.5 } (per-slot active-slot count).
+        if self.count_loss_type in ("ordinal", "presence"):
+            pred_count_scalar = (torch.sigmoid(pred_count.detach()) > 0.5).sum(dim=-1).float()
+        else:
+            pred_count_scalar = pred_count.detach().reshape(-1)
+
         # Count metrics and histogram (streaming, CPU side).
-        pred_count_cpu = pred_count.detach().reshape(-1).cpu()
+        pred_count_cpu = pred_count_scalar.reshape(-1).cpu()
         true_count_cpu = y_count.detach().reshape(-1).cpu()
         count_abs_err_cpu = (pred_count_cpu - true_count_cpu).abs()
         self._val_count_err_sum += float(count_abs_err_cpu.sum().item())
@@ -488,6 +662,11 @@ class AmbiDOALightningModule(pl.LightningModule):
         # Surface key metrics to progress bar and logger.
         self.log("val/angular_error_deg", mean_angular_error, prog_bar=True)
         self.log("val/count_mae", mean_count_error, prog_bar=True)
+        # Slash-free aliases so ModelCheckpoint.filename can interpolate the
+        # monitor value without producing nested subdirectories. Keys in
+        # ModelCheckpoint filename templates must not contain '/'.
+        self.log("val_angular_error_deg", mean_angular_error)
+        self.log("val_count_mae", mean_count_error)
 
         if self.log_timing and self._val_step_time_count > 0:
             self._val_step_ms_epoch = self._val_step_time_sum / float(self._val_step_time_count)
@@ -528,7 +707,18 @@ class AmbiDOALightningModule(pl.LightningModule):
         if train_loss_epoch is None:
             train_loss_epoch = self._metric_to_float(metrics.get("train/loss"))
 
+        train_base_loss_epoch = self._metric_to_float(metrics.get("train/base_loss_epoch"))
+        if train_base_loss_epoch is None:
+            train_base_loss_epoch = self._metric_to_float(metrics.get("train/base_loss"))
+
         val_loss_epoch = self._metric_to_float(metrics.get("val_loss"))
+        # Slash-free aliases logged in on_validation_epoch_end so all key val
+        # metrics can appear side-by-side in the txt epoch summary. val_loss
+        # rises via ordinal BCE confidence drift even while these operational
+        # metrics still improve — showing them together prevents killing runs
+        # on the wrong signal.
+        val_ang_err_epoch = self._metric_to_float(metrics.get("val_angular_error_deg"))
+        val_count_mae_epoch = self._metric_to_float(metrics.get("val_count_mae"))
 
         if train_loss_epoch is None and val_loss_epoch is None:
             return
@@ -543,7 +733,10 @@ class AmbiDOALightningModule(pl.LightningModule):
             self.log("train/clip_ratio", clip_ratio, on_epoch=True, prog_bar=False)
 
         train_txt = f"{train_loss_epoch:.6f}" if train_loss_epoch is not None else "n/a"
+        base_txt = f"{train_base_loss_epoch:.6f}" if train_base_loss_epoch is not None else "n/a"
         val_txt = f"{val_loss_epoch:.6f}" if val_loss_epoch is not None else "n/a"
+        val_ang_txt = f"{val_ang_err_epoch:.2f}" if val_ang_err_epoch is not None else "n/a"
+        val_cmae_txt = f"{val_count_mae_epoch:.3f}" if val_count_mae_epoch is not None else "n/a"
         grad_txt = f"{mean_grad_norm:.4f}" if mean_grad_norm is not None else "n/a"
         if clip_ratio is None:
             clip_txt = "n/a"
@@ -559,7 +752,8 @@ class AmbiDOALightningModule(pl.LightningModule):
             val_step_ms_txt = f"{self._val_step_ms_epoch:.2f}"
         epoch_line = (
             f"Epoch {int(self.current_epoch) + 1} | "
-            f"train_loss={train_txt} | val_loss={val_txt} | "
+            f"train_loss={train_txt} | base_loss={base_txt} | val_loss={val_txt} | "
+            f"val_ang_err={val_ang_txt} | val_count_mae={val_cmae_txt} | "
             f"grad_norm={grad_txt} | clip_ratio={clip_txt} | "
             f"opt_steps={self._train_optimizer_steps_epoch} | "
             f"train_step_ms={train_step_ms_txt} | val_step_ms={val_step_ms_txt}"
@@ -615,9 +809,3 @@ class AmbiDOALightningModule(pl.LightningModule):
                 "frequency": 1,
             },
         }
-
-    def on_fit_end(self):
-        """Release backup tensor storage if fit ends while EMA weights are active."""
-        if self._using_ema_weights:
-            # Keep EMA weights on the model at fit end; just drop raw backup copy.
-            self._ema_backup = None

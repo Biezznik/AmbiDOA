@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import torch
 from torch.utils.data import Dataset
 import torchaudio
@@ -24,9 +25,30 @@ class AmbiDOADataset(Dataset):
     ]
     """
 
-    def __init__(self, manifest_path, audio_dir, sr=11025, window_len_ms=250, dbfs_threshold=-80.0, max_sources=12):
+    def __init__(
+        self,
+        manifest_path,
+        audio_dir,
+        sr=11025,
+        window_len_ms=250,
+        dbfs_threshold=-80.0,
+        max_sources=12,
+        subsample_pct=None,
+        subsample_seed=42,
+    ):
         with open(manifest_path, "r") as f:
             self.entries = json.load(f)
+        # Optional manifest-level subsampling for fast debug iterations. Cuts
+        # both manifest scan time (torchaudio.info per file) and dataset size
+        # proportionally. Subsamples files (not windows), so split-by-file
+        # logic downstream remains valid.
+        self._full_manifest_size = len(self.entries)
+        self.subsample_pct = None
+        if subsample_pct is not None and 0 < float(subsample_pct) < 100:
+            rng = random.Random(int(subsample_seed))
+            n_keep = max(1, int(self._full_manifest_size * float(subsample_pct) / 100.0))
+            self.entries = rng.sample(self.entries, n_keep)
+            self.subsample_pct = float(subsample_pct)
         self.audio_dir = audio_dir
         self.sr = sr
         self.window_len = int(window_len_ms * sr / 1000)

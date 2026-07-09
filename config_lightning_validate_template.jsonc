@@ -31,13 +31,65 @@
   "max_sources": 12,
   "use_posenc": true,
   "dropout": 0.2,
+  // Max DropPath rate at the final encoder layer (0 disables). For validate-only
+  // runs against pre-stochastic-depth checkpoints keep this at 0.0 — the encoder
+  // then falls back to nn.TransformerEncoder, bit-identical to the baseline.
+  "stochastic_depth": 0.0,
+
+  // count_head_hidden:
+  //   true (legacy/default) -> 2-layer MLP head (~70K params).
+  //   false -> single Linear(d_model -> count_out_dim) (~3K params). Reduces
+  //   count-head capacity to memorize per-sample k from the [CLS] feature.
+  //   NOTE: switching this value makes the count-head weights structurally
+  //   incompatible with previous checkpoints — strict=False loaders will skip
+  //   the head, reinitializing it from scratch.
+  "count_head_hidden": true,
 
   // -------------------- Loss / Metrics --------------------
-  // Current pipeline supports only regression for count head.
+  // count_loss_type:
+  //   "regression" — single scalar logit + SmoothL1 (legacy; can collapse toward
+  //                  the dataset-mean k under prediction uncertainty).
+  //   "ordinal"    — max_sources cumulative logits + BCE on P(k>=j). Inference
+  //                  rounds the count as k_pred = sum_j 1{sigmoid(logit_j) > 0.5}.
+  //   "presence"   — max_sources per-slot logits + BCE against the Hungarian
+  //                  matched assignment (1 for slots that PI-matched a real
+  //                  source, 0 otherwise). Count is structurally derived as
+  //                  k_pred = sum_j 1{sigmoid(slot_logit_j) > 0.5}. Ties the
+  //                  count and position heads to the same slot indices, so the
+  //                  count cannot claim sources the position head cannot
+  //                  localize. Requires count_consistency_weight = 0 and
+  //                  count_per_k_weights = null (both undefined in this mode).
+  // Checkpoint compatibility: switching between modes changes the count-head
+  // output dim, so checkpoints across modes are not weight-compatible.
   "count_loss_type": "regression",
   "lambda_count": 0.5,
   "lambda_pos": 2.5,
   "pos_loss_type": "cosine",
+
+  // count_label_smoothing (ordinal or presence):
+  //   Replaces hard {0,1} BCE targets with {ε, 1-ε}. Attacks the val-BCE
+  //   confidence-overfit drift seen on the 2026_06_27 run while count_mae and
+  //   angular_error were stable. 0.0 disables (legacy behavior); 0.05 is a
+  //   typical starting point; must be in [0.0, 0.5).
+  //   Optimal BCE floor becomes -(1-ε)·log(1-ε) - ε·log(ε) (≈ 0.20 at ε=0.05).
+  "count_label_smoothing": 0.0,
+
+  // Count-from-positions consistency (Strategy #3, regression/ordinal only):
+  //   Aux loss tying pred_count to the number of PI-matched position slots
+  //   whose cos(pred, true) > cos_threshold. Pushes the count head not to
+  //   claim sources the position head cannot localize. Weight 0 disables.
+  //   Undefined in 'presence' mode (the presence head is already structurally
+  //   coupled to the matched slots) — must be 0.0 there.
+  "count_consistency_weight": 0.0,
+  "count_consistency_cos_threshold": 0.5,
+
+  // Per-k class balance weights on the ordinal count BCE (ordinal only).
+  //   Alternative to a class-balanced sampler: reweights the BCE contribution
+  //   of each sample by w_k based on its true source count k. Suggested
+  //   formula w_k = 1 / sqrt(freq_k). Length must equal max_sources + 1
+  //   (indices k = 0..max_sources); all entries non-negative. null disables.
+  //   Applied in both train and val loss for apples-to-apples comparison.
+  "count_per_k_weights": null,
 
   // -------------------- Checkpoint --------------------
   // Used by --validate-only if --checkpoint is not provided.

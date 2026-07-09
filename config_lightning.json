@@ -1,57 +1,111 @@
 {
-  "manifest_path": "D:\\pm\\bb\\New_Dataset\\samples2locator_5001_regions_updated_manifest_400_samples_aug2.json",
-  "audio_dir": "D:\\pm\\bb\\New_Dataset\\out",
-  "batch_size": 64,
-  "num_workers": 8,
-  "train_num_workers": 8,
-  "val_num_workers": 0,
-  "val_ratio": 0.2,
-  "split_seed": 42,
-  "sr": 11025,
-  "window_len_ms": 250,
-  "dbfs_threshold": -80.0,
-  "require_cuda": true,
-  "n_channels": 16,
-  "d_model": 256,
-  "nhead": 16,
-  "num_layers": 8,
-  "dim_feedforward": 1024,
-  "max_sources": 12,
-  "use_posenc": true,
-  "dropout": 0.15,
-  "num_epochs": 3,
-  "lr": 0.0005,
-  "finetune_from": null,
-  "finetune_lr": 0.0005,
-  "reset_optimizer": true,
-  "freeze_n_encoder_layers": 0,
-  "freeze_posenc": false,
-  "count_loss_type": "regression",
-  "lambda_count": 0.5,
-  "lambda_pos": 2.5,
-  "pos_loss_type": "cosine",
-  "use_scheduler": true,
-  "warmup_steps": null,
-  "weight_decay": 0.0001,
-  "grad_clip": 0.0,
-  "precision": "32-true",
-  "matmul_precision": "high",
-  "save_top_k": 2,
-  "save_last": true,
-  "log_lr": true,
-  "early_stopping_patience": 0,
-  "accumulate_grad_batches": 1,
-  "log_grad_norm": true,
-  "use_ema": true,
-  "ema_decay": 0.999,
-  "ema_update_after_step": 1000,
-  "log_timing": false,
-  "timing_log_every_n_steps": 0,
-  "timing_cuda_sync": false,
-  "run_txt_timestamp": true,
-  "run_txt_log_name": null,
-  "log_every_n_steps": 1500,
-  "deterministic": false,
-  "fast_dev_run": false,
-  "num_sanity_val_steps": 0
+  "data": {
+    "manifest_path": "D:\\pm\\bb\\New_Dataset\\samples2locator_5001_regions_updated_manifest_400_samples_aug2.json",
+    "audio_dir": "D:\\pm\\bb\\New_Dataset\\out",
+    "sr": 11025,
+    "window_len_ms": 250,
+    "dbfs_threshold": -80.0,
+    "batch_size": 64,
+    "num_workers": 17,
+    "train_num_workers": 13,
+    "val_num_workers": 4,
+    "val_ratio": 0.2,
+    "split_seed": 42
+  },
+
+  "model": {
+    "n_channels": 16,
+    "d_model": 192,
+    "nhead": 8,
+    "num_layers": 8,
+    "dim_feedforward": 1024,
+    "max_sources": 12,
+    "use_posenc": true,
+    "dropout": 0.4,
+    "share_encoder_weights": false,
+    "stochastic_depth": 0.2,
+    "gradient_checkpointing": false,
+    "compile_model": false,
+    "compile_backend": "aot-eager",
+    "count_head_hidden": false
+  },
+
+  "loss": {
+    "count_loss_type": "presence",
+    "lambda_count": 1.5,
+    "lambda_pos": 5.0,
+    "pos_loss_type": "cosine",
+    "count_label_smoothing": 0.1,
+    "count_consistency_weight": 0.0,
+    "count_consistency_cos_threshold": 0.5,
+    "count_per_k_weights": null
+
+
+  },
+
+  "optimizer": {
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "use_scheduler": true,
+    "warmup_steps": null,
+    "grad_clip": 0.0,
+    "accumulate_grad_batches": 1
+  },
+
+  "ema": {
+    "use_ema": true,
+    "ema_decay": 0.9995,
+    "ema_update_after_step": 400,
+    "mean_teacher_weight": 0.5
+  },
+
+  "regularization": {
+    "rdrop_weight": 0.5,
+    "regularization_every_n_steps": 1
+  },
+
+  "finetune": {
+    "finetune_from": null,
+    "finetune_lr": 0.0005,
+    "reset_optimizer": true,
+    "freeze_n_encoder_layers": 0,
+    "freeze_posenc": false
+  },
+
+  "training": {
+    "num_epochs": 15,
+    "early_stopping_patience": 2,
+    "save_top_k": 1,
+    "save_last": true,
+    "checkpoint_monitor": "val_angular_error_deg",
+    "checkpoint_monitor_mode": "min"
+  },
+
+  "hardware": {
+    "require_cuda": true,
+    "precision": "32-true",
+    "matmul_precision": "high",
+    "deterministic": false
+  },
+
+  "logging": {
+    "log_lr": true,
+    "log_grad_norm": true,
+    "log_every_n_steps": 300,
+    "run_txt_timestamp": true,
+    "run_txt_log_name": null,
+    "log_timing": false,
+    "timing_log_every_n_steps": 0,
+    "timing_cuda_sync": false
+  },
+
+  "debug": {
+    "fast_dev_run": false,
+    "overfit_dev_run": false,
+    "num_sanity_val_steps": 0,
+    "overfit_test_epochs": 50,
+    "overfit_test_threshold": 0.2,
+    "overfit_test_batch_size": 16,
+    "subsample_pct": 25
+  }
 }

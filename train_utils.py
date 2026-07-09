@@ -157,33 +157,102 @@ def multi_source_loss(
     lambda_count=0.5,
     lambda_pos=1.5,
     pos_loss_type="cosine",
+    count_label_smoothing: float = 0.0,
+    count_per_k_weights: Optional[torch.Tensor] = None,
     return_components: bool = False,
+    return_matches: bool = False,
 ):
     """
     Weighted multi-task loss:
       total = lambda_count * count_loss + lambda_pos * position_loss_PI
 
     Inputs:
-      pred_count: [B,1]
+      pred_count: [B,1] in "regression" mode, [B, max_sources] of logits in
+                  "ordinal" mode, [B, max_sources] per-slot presence logits in
+                  "presence" mode.
       true_count: [B]
       pred_pos:   [B,S,3]
       true_pos:   [B,S,3]
       mask:       [B,S] (1 for active GT slots)
+
+    count_label_smoothing: applied in "ordinal" and "presence" modes. Hard
+      {0, 1} BCE targets become {ε, 1-ε}. Prevents the train-time confidence
+      runaway that drives val BCE up while val/count_mae stays stable. Optimal
+      BCE floor becomes -(1-ε)·log(1-ε) - ε·log(ε) (≈ 0.20 at ε=0.05) instead of 0.
+
+    count_per_k_weights: only applied in "ordinal" mode. Tensor of length
+      max_sources+1 giving a per-sample weight based on the sample's true k.
+      Alternative to a class-balanced sampler: reweights the BCE contribution
+      of each sample by w_k so under-represented counts get amplified gradient.
+      Suggested formula: w_k = 1 / sqrt(freq_k). None disables (baseline).
+      Undefined and rejected in "presence" mode (presence BCE is naturally
+      balanced by the mask ratio k/S vs (S-k)/S per sample).
     """
-    if count_loss_type != "regression":
+    # PI matching is needed once — for the position loss always, and for the
+    # presence-mode head-1 loss as well. Compute up-front and reuse.
+    B, S, _ = pred_pos.shape
+    match_idx_batch = _match_batch(pred_pos, true_pos, mask)
+
+    if count_loss_type == "regression":
+        # SmoothL1 is more robust than plain MSE on the scalar target.
+        loss_count = nn.SmoothL1Loss(beta=1.0)(pred_count.squeeze(), true_count.squeeze().float())
+    elif count_loss_type == "ordinal":
+        # Ordinal cumulative encoding: head j predicts P(k >= j+1) via BCE.
+        # Targets shape [B, max_sources]: targets[b, j] = 1 iff true_count[b] >= j+1.
+        # This sidesteps the SmoothL1 mean-regression collapse on uncertain k.
+        max_sources = pred_count.size(-1)
+        thresholds = torch.arange(1, max_sources + 1, device=pred_count.device, dtype=pred_count.dtype)
+        targets = (true_count.reshape(-1, 1).float() >= thresholds.reshape(1, -1)).to(pred_count.dtype)
+        if count_label_smoothing > 0.0:
+            eps = float(count_label_smoothing)
+            targets = targets * (1.0 - 2.0 * eps) + eps
+        if count_per_k_weights is not None:
+            # Per-sample weight w_k[b], broadcast [B, 1] over BCE's [B, max_sources].
+            # F.BCE(..., weight=w, reduction='mean') = mean(w * bce_per_elem), so
+            # w == 1 everywhere reproduces the un-weighted baseline exactly.
+            weights_dev = count_per_k_weights.to(device=pred_count.device, dtype=pred_count.dtype)
+            k_idx = true_count.reshape(-1).round().clamp(0, max_sources).long()
+            sample_weight = weights_dev.index_select(0, k_idx).reshape(-1, 1)
+            loss_count = F.binary_cross_entropy_with_logits(
+                pred_count, targets, weight=sample_weight
+            )
+        else:
+            loss_count = F.binary_cross_entropy_with_logits(pred_count, targets)
+    elif count_loss_type == "presence":
+        # Per-slot presence logits. Target[b, s] = 1 iff slot s was PI-matched to
+        # a real GT source in sample b, else 0. Structurally couples the count
+        # signal to the position head's slot usage: a "used" slot must both hold
+        # a source (BCE=1) AND localize it well (cosine loss on the matched pair).
+        if count_per_k_weights is not None:
+            raise ValueError(
+                "count_per_k_weights is undefined in 'presence' mode; presence BCE is "
+                "naturally balanced by the mask. Set count_per_k_weights=None."
+            )
+        presence_target = pred_count.new_zeros((B, S))
+        for b in range(B):
+            active = mask[b] > 0.5
+            k = int(active.sum().item())
+            if k == 0:
+                continue
+            idx_pred = match_idx_batch[b]
+            if len(idx_pred) != k:
+                continue
+            idx_pred_t = torch.as_tensor(idx_pred, dtype=torch.long, device=pred_pos.device)
+            presence_target[b].index_fill_(0, idx_pred_t, 1.0)
+        if count_label_smoothing > 0.0:
+            eps = float(count_label_smoothing)
+            presence_target = presence_target * (1.0 - 2.0 * eps) + eps
+        loss_count = F.binary_cross_entropy_with_logits(pred_count, presence_target)
+    else:
         raise ValueError(
             f"Unsupported count_loss_type='{count_loss_type}'. "
-            "Current AmbiDOA head predicts scalar counts, so only 'regression' is supported."
+            "Expected 'regression', 'ordinal', or 'presence'."
         )
 
-    # Count loss: SmoothL1 is more robust than plain MSE.
-    loss_count = nn.SmoothL1Loss(beta=1.0)(pred_count.squeeze(), true_count.squeeze().float())
-
-    # PI position loss: compute only over active matched sources.
-    B, S, _ = pred_pos.shape
+    # PI position loss: compute only over active matched sources. Reuses the
+    # match_idx_batch computed above.
     loss_pos_sum = pred_pos.new_tensor(0.0)
     active_sum = 0
-    match_idx_batch = _match_batch(pred_pos, true_pos, mask)
 
     for b in range(B):
         active = mask[b] > 0.5
@@ -209,9 +278,77 @@ def multi_source_loss(
     loss_pos = loss_pos_sum / (float(active_sum) + 1e-8)
     total_loss = lambda_count * loss_count + lambda_pos * loss_pos
 
+    if return_components and return_matches:
+        return total_loss, loss_count.detach(), loss_pos.detach(), match_idx_batch
     if return_components:
         return total_loss, loss_count.detach(), loss_pos.detach()
+    if return_matches:
+        return total_loss, match_idx_batch
     return total_loss
+
+
+# ----- Auxiliary count-consistency loss (Strategy #3) -----
+
+
+def position_consistency_count_loss(
+    pred_count,
+    pred_pos,
+    true_pos,
+    mask,
+    count_loss_type: str,
+    match_idx_batch=None,
+    cos_threshold: float = 0.5,
+):
+    """Auxiliary loss tying the count head to position-quality evidence.
+
+    Forces the count head's prediction to agree with the number of position
+    slots the model has *actually localized* (PI-matched and within cos_threshold
+    of GT). Early in training, n_good < k_gt, pushing the count head not to
+    claim sources it cannot place. Late in training, n_good → k_gt and the term
+    vanishes naturally — no scheduling needed.
+
+    Differs from the primary count loss: primary targets k_gt regardless of
+    position quality, this targets the number of *well-localized* matched
+    slots. Provides a second gradient path to the count head grounded in the
+    position output rather than only the [CLS] global pool.
+
+    match_idx_batch: optional pre-computed PI matches from multi_source_loss to
+      avoid running Hungarian twice per training step. When None, computed here.
+    """
+    B, S, _ = pred_pos.shape
+
+    # Differentiable scalar prediction from the count head.
+    if count_loss_type == "regression":
+        pred_count_scalar = pred_count.reshape(B, -1).squeeze(-1).float()
+    elif count_loss_type == "ordinal":
+        # Expected count = Σ_j P(k>=j+1); differentiable, no thresholding.
+        pred_count_scalar = torch.sigmoid(pred_count).sum(dim=-1)
+    else:
+        raise ValueError(
+            f"Unsupported count_loss_type='{count_loss_type}'. Expected 'regression' or 'ordinal'."
+        )
+
+    if match_idx_batch is None:
+        match_idx_batch = _match_batch(pred_pos, true_pos, mask)
+
+    # Non-differentiable target: number of slots with cos(pred, gt) > τ after matching.
+    with torch.no_grad():
+        pred_n = pred_pos / (pred_pos.norm(dim=2, keepdim=True) + 1e-8)
+        true_n = true_pos / (true_pos.norm(dim=2, keepdim=True) + 1e-8)
+        n_good = pred_pos.new_zeros(B)
+        for b in range(B):
+            active = mask[b] > 0.5
+            k = int(active.sum().item())
+            if k == 0:
+                continue
+            idx_pred = match_idx_batch[b]
+            if len(idx_pred) != k:
+                continue
+            idx_pred_t = torch.as_tensor(idx_pred, dtype=torch.long, device=pred_pos.device)
+            cos_per_pair = (pred_n[b].index_select(0, idx_pred_t) * true_n[b, active, :]).sum(dim=-1)
+            n_good[b] = (cos_per_pair > cos_threshold).float().sum()
+
+    return F.smooth_l1_loss(pred_count_scalar, n_good)
 
 
 # --------------------------- PI angular metrics ---------------------------

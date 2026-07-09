@@ -1,9 +1,26 @@
+import copy
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from AmbiDOA import log_print
 from datetime import datetime
+
+
+def _drop_path(x_residual: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    """Per-sample stochastic depth applied to a layer's residual contribution.
+
+    Inverted scaling: multiply the residual by a per-sample Bernoulli mask and
+    divide by keep_prob, so expected magnitude is preserved without any rescale
+    at eval time. No-op when drop_prob == 0 or in eval mode.
+    """
+    if drop_prob <= 0.0 or not training:
+        return x_residual
+    keep_prob = 1.0 - drop_prob
+    mask_shape = (x_residual.shape[0],) + (1,) * (x_residual.ndim - 1)
+    mask = torch.empty(mask_shape, device=x_residual.device, dtype=x_residual.dtype).bernoulli_(keep_prob)
+    return x_residual.div(keep_prob).mul(mask)
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -50,10 +67,77 @@ class SinusoidalPositionalEncoding(nn.Module):
         return x + self.pe[:, :L, :]
 
 
+class _SharedEncoder(nn.Module):
+    """Applies a single TransformerEncoderLayer num_layers times (ALBERT-style weight sharing).
+
+    All passes through the stack share identical parameters, reducing memorizable
+    capacity while preserving the depth of iterative refinement.
+
+    use_checkpoint: when True, each pass is wrapped in torch.utils.checkpoint so
+    intermediate activations (including the O(T²) attention matrix) are not stored
+    for backward — they are recomputed on demand. This trades compute for memory
+    and is essential for long sequences or large batch sizes.
+
+    drop_rates: optional list of length num_layers with per-pass DropPath rates.
+    When None (or all zeros), behavior is bit-identical to the unregularized baseline.
+    Drop is applied to the residual contribution (out - x) so layer internals
+    stay untouched.
+    """
+
+    def __init__(self, layer: nn.TransformerEncoderLayer, num_layers: int, use_checkpoint: bool = False, drop_rates=None):
+        super().__init__()
+        self.layer = layer
+        self.num_layers = num_layers
+        self.use_checkpoint = use_checkpoint
+        self.drop_rates = list(drop_rates) if drop_rates is not None else [0.0] * num_layers
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for i in range(self.num_layers):
+            if self.use_checkpoint and self.training:
+                out = checkpoint(self.layer, x, use_reentrant=False)
+            else:
+                out = self.layer(x)
+            dp = self.drop_rates[i]
+            if dp > 0.0:
+                x = x + _drop_path(out - x, dp, self.training)
+            else:
+                x = out
+        return x
+
+
+class _StochasticDepthEncoder(nn.Module):
+    """Stack of independent TransformerEncoderLayers with per-layer DropPath.
+
+    Mirrors nn.TransformerEncoder but applies stochastic depth on each layer's
+    residual contribution via the residual-extraction trick (out - x). Treats the
+    full block (attn + FFN) as one residual unit — coarser than per-sublayer
+    drop but does not require cracking the layer's internals.
+    """
+
+    def __init__(self, encoder_layer: nn.TransformerEncoderLayer, num_layers: int, drop_rates):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+        self.drop_rates = list(drop_rates)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer, dp in zip(self.layers, self.drop_rates):
+            out = layer(x)
+            if dp > 0.0:
+                x = x + _drop_path(out - x, dp, self.training)
+            else:
+                x = out
+        return x
+
+
 class AmbiTransformerDOA(nn.Module):
     """
     Transformer model for multi-source DOA in Ambisonics:
-      - HEAD 1 (count): predicted number of sources (scalar regression)
+      - HEAD 1: source count or per-slot presence. Three modes:
+          * "regression" — scalar SmoothL1 target (one logit).
+          * "ordinal"    — max_sources independent BCE heads predicting P(k>=j).
+          * "presence"   — max_sources per-slot presence logits (BCE against the
+                           PI-matched assignment). Count is derived from the
+                           position head's slot usage, not predicted separately.
       - HEAD 2 (positions): [max_sources, 3] unit vectors (x, y, z)
 
     High-level architecture:
@@ -81,10 +165,32 @@ class AmbiTransformerDOA(nn.Module):
         dropout: float = 0.3,  # regularization
         max_sources: int = 12,  # maximum number of predicted sources
         use_posenc: bool = True,  # enable positional encoding
+        share_encoder_weights: bool = False,  # ALBERT-style cross-layer weight sharing
+        gradient_checkpointing: bool = False,  # recompute activations in backward to save memory
+        stochastic_depth: float = 0.0,  # max DropPath rate at the final layer (0 disables)
+        count_loss_type: str = "regression",  # "regression" -> 1 logit; "ordinal" -> max_sources BCE logits; "presence" -> per-slot presence logits
+        count_head_hidden: bool = True,  # False -> single Linear count head (~3K params vs ~70K). Ignored in "presence" mode.
     ):
         super().__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        if count_loss_type not in ("regression", "ordinal", "presence"):
+            raise ValueError(
+                f"count_loss_type must be 'regression', 'ordinal', or 'presence', got {count_loss_type!r}."
+            )
         self.max_sources = max_sources
+        self.count_loss_type = count_loss_type
+
+        # Linear decay schedule: layer 0 keeps everything, layer L-1 drops at the
+        # configured max rate. p_ℓ = stochastic_depth * ℓ / (L-1). When num_layers
+        # == 1 the schedule collapses to a single rate. drop_rates=None means
+        # disabled — preserves bit-identical baseline against pre-SD checkpoints.
+        if stochastic_depth > 0.0:
+            if num_layers == 1:
+                drop_rates = [stochastic_depth]
+            else:
+                drop_rates = [stochastic_depth * i / (num_layers - 1) for i in range(num_layers)]
+        else:
+            drop_rates = None
 
         # (1) Project channel features 16 -> d_model.
         self.proj = nn.Sequential(
@@ -109,16 +215,51 @@ class AmbiTransformerDOA(nn.Module):
             norm_first=True,  # Pre-LN
             activation="gelu",
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        if share_encoder_weights:
+            # One set of weights applied num_layers times — reduces memorizable
+            # parameters while preserving iterative refinement depth.
+            self.transformer = _SharedEncoder(
+                enc_layer,
+                num_layers,
+                use_checkpoint=gradient_checkpointing,
+                drop_rates=drop_rates,
+            )
+        elif drop_rates is not None:
+            self.transformer = _StochasticDepthEncoder(enc_layer, num_layers, drop_rates)
+        else:
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.pre_head_norm = nn.LayerNorm(d_model)  # normalization before output heads
 
-        # (4) HEAD 1: source-count regression.
-        self.n_sources_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
-        )
+        # (4) HEAD 1: source count OR per-slot presence.
+        #   - regression: single scalar logit (SmoothL1 target).
+        #   - ordinal: max_sources logits; head j predicts P(k >= j+1) via BCE.
+        #   - presence: max_sources per-slot presence logits (BCE against PI
+        #               assignment). Count is derived downstream as
+        #               sum_j 1{sigmoid(presence_j) > 0.5}. No dedicated count
+        #               head is built — n_sources_head stays None and the
+        #               presence_head takes its place in forward().
+        # count_head_hidden=False collapses the 2-layer MLP to a single Linear
+        # (d_model -> count_out_dim). Reduces head capacity from ~70K to ~3K
+        # params — strong remedy against count-head memorization of per-sample k
+        # from the pooled [CLS] feature. Ignored in presence mode (no count head).
+        if count_loss_type == "presence":
+            # No dedicated count head. Presence is a single Linear per slot;
+            # any consistency with position emerges structurally through the
+            # shared PI assignment used for both losses.
+            self.n_sources_head = None
+            self.presence_head = nn.Linear(d_model, max_sources)
+        else:
+            count_out_dim = max_sources if count_loss_type == "ordinal" else 1
+            if count_head_hidden:
+                self.n_sources_head = nn.Sequential(
+                    nn.Linear(d_model, d_model),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model, count_out_dim),
+                )
+            else:
+                self.n_sources_head = nn.Linear(d_model, count_out_dim)
+            self.presence_head = None
 
         # (5) HEAD 2: source positions (max_sources * 3).
         self.positions_head = nn.Sequential(
@@ -132,7 +273,8 @@ class AmbiTransformerDOA(nn.Module):
         """
         x: [batch, n_channels, n_samples] -> [B, 16, T]
         Returns:
-          n_sources: [B, 1]
+          head1:     [B, 1] in "regression" mode, [B, max_sources] logits in "ordinal"
+                     mode, [B, max_sources] per-slot presence logits in "presence" mode.
           positions: [B, max_sources, 3] unit vectors
         """
         # Convert to Transformer layout [B, T, C].
@@ -153,8 +295,15 @@ class AmbiTransformerDOA(nn.Module):
         # Normalize before heads.
         feats = self.pre_head_norm(feats)
 
-        # HEAD 1: source count.
-        n_sources = self.n_sources_head(feats)  # [B, 1]
+        # HEAD 1: source count OR per-slot presence. Output shape depends on
+        # count_loss_type:
+        #   "regression" -> [B, 1] scalar logit,
+        #   "ordinal"    -> [B, max_sources] cumulative BCE logits,
+        #   "presence"   -> [B, max_sources] per-slot presence logits.
+        if self.count_loss_type == "presence":
+            n_sources = self.presence_head(feats)
+        else:
+            n_sources = self.n_sources_head(feats)
 
         # HEAD 2: source positions.
         positions = self.positions_head(feats)  # [B, S * 3]

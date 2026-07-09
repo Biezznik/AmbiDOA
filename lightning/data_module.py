@@ -32,6 +32,17 @@ from train_utils import split_by_file
 from utils_device import dataloader_kwargs_for
 
 
+def _flatten_config(config):
+    """Flatten one level of grouped config sections into a flat dict."""
+    flat = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
 class AmbiDOADataModule(pl.LightningDataModule):
     """Prepare AmbiDOA train/validation datasets and dataloaders.
 
@@ -55,7 +66,7 @@ class AmbiDOADataModule(pl.LightningDataModule):
             if config_path is None:
                 config_path = Path(__file__).resolve().parents[1] / "config.json"
             with open(config_path, encoding="utf-8-sig") as f:
-                config = json.load(f)
+                config = _flatten_config(json.load(f))
 
         self.config = dict(config)
         self.config_path = Path(config_path) if config_path is not None else None
@@ -78,11 +89,21 @@ class AmbiDOADataModule(pl.LightningDataModule):
 
         # Keep the current dataset contract and allow optional overrides in config.json.
         # This preserves compatibility with existing config and manifest generation.
+        # `subsample_pct` is a debug feature that drops a random fraction of
+        # manifest entries before window enumeration — the run is otherwise
+        # identical to a regular train/validation run (logging, checkpoints,
+        # callbacks all active).
+        subsample_pct = self.config.get("subsample_pct")
+        if subsample_pct is not None:
+            subsample_pct = float(subsample_pct)
+        self.subsample_pct = subsample_pct
         self.dataset_kwargs = dict(
             sr=int(self.config.get("sr", 11025)),
             window_len_ms=int(self.config.get("window_len_ms", 250)),
             dbfs_threshold=float(self.config.get("dbfs_threshold", -80.0)),
             max_sources=int(self.config.get("max_sources", 12)),
+            subsample_pct=subsample_pct,
+            subsample_seed=int(self.config.get("split_seed", 42)),
         )
 
         self.train_set = None
@@ -145,6 +166,16 @@ class AmbiDOADataModule(pl.LightningDataModule):
 
         # Build full dataset from manifest + audio directory.
         dataset = AmbiDOADataset(self.manifest_path, self.audio_dir, **self.dataset_kwargs)
+
+        # Mark the run as subsampled in the run TXT log so checkpoints from
+        # this run aren't mistaken for production-quality artifacts.
+        if self.subsample_pct is not None and 0 < self.subsample_pct < 100:
+            kept = len(dataset.entries)
+            total = getattr(dataset, "_full_manifest_size", kept)
+            self._append_run_txt_log(
+                f"[SUBSAMPLED] Run uses {self.subsample_pct:.2f}% of manifest "
+                f"({kept}/{total} files, seed={self.dataset_kwargs['subsample_seed']})"
+            )
 
         # Split by source file identity to avoid leakage across windows.
         self.train_set, self.val_set = split_by_file(

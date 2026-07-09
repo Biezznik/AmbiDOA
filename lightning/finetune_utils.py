@@ -76,9 +76,28 @@ def freeze_first_n_encoder_layers(model, n):
     """Freeze first `n` encoder layers for staged fine-tuning.
 
     Supports both:
-    - model.transformer.layers
+    - model.transformer.layers  (standard independent-layer encoder)
     - model.encoder.layers
+
+    Shared-weight encoder (_SharedEncoder):
+      All passes through the stack use the same single layer, so partial
+      freezing is not meaningful. Any n > 0 freezes the shared layer entirely.
+      n == 0 leaves it trainable.
     """
+    n = int(n)
+
+    # --- Shared-weight encoder: single .layer attribute, no .layers list ---
+    transformer = getattr(model, "transformer", None)
+    if transformer is not None and hasattr(transformer, "layer") and not hasattr(transformer, "layers"):
+        if n > 0:
+            freeze_params(transformer.layer)
+            print(
+                f"[FT] Shared encoder: frozen entirely "
+                f"(freeze_n_encoder_layers={n} with shared weights freezes the whole encoder)."
+            )
+        return
+
+    # --- Standard independent-layer encoder ---
     layers = None
     layer_path = None
     if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
@@ -93,7 +112,7 @@ def freeze_first_n_encoder_layers(model, n):
         return
 
     # Clamp requested number of frozen layers to valid range.
-    n = max(0, min(int(n), len(layers)))
+    n = max(0, min(n, len(layers)))
     for i in range(n):
         freeze_params(layers[i])
     if n > 0:

@@ -46,3 +46,6 @@ main03 imac.py
 # Local scratch / docs not for repo
 .reaper_api_doc.html
 temp.py
+COMMIT_MSG.txt
+CHANGES_SINCE_d6bc5b6.md
+CHANGES_PRESENCE_COUNT_HEAD.md
