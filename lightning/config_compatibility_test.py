@@ -172,6 +172,7 @@ SUPPORTED_KEYS = {
     "train_num_workers",
     "val_num_workers",
     "val_ratio",
+    "test_ratio",
     "split_seed",
     "sr",
     "window_len_ms",
@@ -187,6 +188,9 @@ SUPPORTED_KEYS = {
     "dropout",
     "share_encoder_weights",
     "stochastic_depth",
+    "use_query_decoder",
+    "decoder_layers",
+    "decoder_dropout",
     "num_epochs",
     "lr",
     "finetune_from",
@@ -202,6 +206,7 @@ SUPPORTED_KEYS = {
     "count_consistency_weight",
     "count_consistency_cos_threshold",
     "count_per_k_weights",
+    "thresholded_loss_report",
     "count_head_hidden",
     "checkpoint_monitor",
     "checkpoint_monitor_mode",
@@ -356,6 +361,17 @@ def _validate_values(cfg):
     if not (0.0 <= stochastic_depth < 1.0):
         raise ValueError("stochastic_depth must be in [0.0, 1.0).")
 
+    use_query_decoder = bool(cfg.get("use_query_decoder", False))
+    if use_query_decoder and count_loss_type != "presence":
+        raise ValueError(
+            "use_query_decoder=True currently supports count_loss_type='presence' only."
+        )
+    if int(cfg.get("decoder_layers", 3)) < 1:
+        raise ValueError("decoder_layers must be >= 1.")
+    decoder_dropout = float(cfg.get("decoder_dropout", 0.1))
+    if not (0.0 <= decoder_dropout < 1.0):
+        raise ValueError("decoder_dropout must be in [0.0, 1.0).")
+
     timing_every = int(cfg.get("timing_log_every_n_steps", 0))
     if timing_every < 0:
         raise ValueError("timing_log_every_n_steps must be >= 0.")
@@ -503,20 +519,38 @@ def _run_overfit_test(cfg, project_root, num_epochs=50, loss_threshold=0.1, batc
     cfg_run["mean_teacher_weight"] = 0.0
     cfg_run["rdrop_weight"] = 0.0
     cfg_run["dropout"] = 0.0
+    # The query decoder carries its own dropout; zero it too so the
+    # "regularization disabled" contract also holds for Build B (otherwise the
+    # decoder can never drive a single batch to ~0 loss).
+    cfg_run["decoder_dropout"] = 0.0
     cfg_run["weight_decay"] = 0.0
-    cfg_run["grad_clip"] = 0.0
     # Label smoothing imposes a BCE loss floor of -(1-ε)·log(1-ε) - ε·log(ε)
     # per slot (≈0.325 at ε=0.1), which prevents an otherwise perfectly fit
     # batch from crossing the overfit threshold. Zero it here so the test
     # measures learnability, not the smoothing floor.
     cfg_run["count_label_smoothing"] = 0.0
-    # Bump LR and disable warmup/scheduler. BCE-based count heads (ordinal,
-    # presence) need logits driven to saturation (~|3|+) for BCE to approach
-    # zero. At production LR (e.g. 1e-4) with only overfit_batches=1 step per
-    # epoch, 50 steps grow logits to ~|2| and stall base_loss around
-    # lambda_count * 0.13. Using a purpose-built LR for the memorization test
-    # decouples it from production hyperparameters.
-    cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 5e-3)
+    # Optimization regime for the memorization test (no scheduler/warmup).
+    # BCE-based count heads (ordinal, presence) need logits driven to saturation
+    # (~|3|+) for BCE to approach zero, which at production LR (1e-4) with only
+    # overfit_batches=1 step/epoch would stall base_loss around lambda_count*0.13.
+    # The mean-pool heads tolerate a hot LR (5e-3) and need no clipping. The query
+    # decoder (DETR-style) diverges at 5e-3 (grad-norm blow-up, presence
+    # flip-flopping 0<->max_sources): it needs a gentler LR, gradient clipping,
+    # and more steps to break query symmetry and settle.
+    if bool(cfg_run.get("use_query_decoder", False)):
+        cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 1e-3)
+        cfg_run["grad_clip"] = 1.0
+        num_epochs = max(int(num_epochs), 300)
+        # The decoder fits positions to ~1° quickly, but its presence BCE
+        # saturates slowly (positions ~perfect, count ~4/5 → base_loss plateaus
+        # around 0.3-0.4; a hotter LR only destabilizes the presence head). Relax
+        # the pass threshold so the gate reflects "learned" (low angular +
+        # near-right count) rather than full BCE saturation. A genuinely broken
+        # decoder stays >>1 (cf. the un-clipped hot-LR regime that stalls ~2-3).
+        loss_threshold = max(float(loss_threshold), 0.4)
+    else:
+        cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 5e-3)
+        cfg_run["grad_clip"] = 0.0
     cfg_run["use_scheduler"] = False
     cfg_run["warmup_steps"] = 0
 

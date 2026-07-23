@@ -75,6 +75,7 @@ class AmbiDOALightningModule(pl.LightningModule):
         count_consistency_weight=0.0,
         count_consistency_cos_threshold=0.5,
         count_per_k_weights=None,
+        thresholded_loss_report=False,
         use_scheduler=True,
         weight_decay=0.0,
         warmup_steps=None,
@@ -126,6 +127,12 @@ class AmbiDOALightningModule(pl.LightningModule):
         self.count_label_smoothing = float(count_label_smoothing)
         self.count_consistency_weight = float(count_consistency_weight)
         self.count_consistency_cos_threshold = float(count_consistency_cos_threshold)
+        # Diagnostic-only: report train/base_loss and val_loss with a
+        # confidence-free ("thresholded") count term so they stay on the same BCE
+        # scale (comparable to each other) but do not exhibit the count-BCE
+        # confidence up-drift. Affects logging only — not the gradient target and
+        # not the checkpoint/early-stop monitor (val_angular_error_deg).
+        self.thresholded_loss_report = bool(thresholded_loss_report)
 
         # Optional per-k class balance weights for the ordinal count BCE.
         # Registered as a non-persistent buffer so it follows the module across
@@ -429,7 +436,7 @@ class AmbiDOALightningModule(pl.LightningModule):
         # --- Task loss (count + PI position) ---
         # Also receive the PI match indices so the consistency aux loss can reuse
         # them — avoids a second Hungarian solve per training step.
-        total_loss, loss_cnt, loss_pos, match_idx_batch = multi_source_loss(
+        _loss_out = multi_source_loss(
             pred_count,
             y_count,
             pred_pos,
@@ -443,7 +450,13 @@ class AmbiDOALightningModule(pl.LightningModule):
             count_per_k_weights=self.count_per_k_weights,
             return_components=True,
             return_matches=True,
+            return_thresholded_count=self.thresholded_loss_report,
         )
+        if self.thresholded_loss_report:
+            total_loss, loss_cnt, loss_pos, match_idx_batch, loss_cnt_thresh = _loss_out
+        else:
+            total_loss, loss_cnt, loss_pos, match_idx_batch = _loss_out
+            loss_cnt_thresh = None
 
         # --- Mean Teacher and R-Drop (applied every N steps to reduce compute) ---
         apply_regularization = (batch_idx % self.regularization_every_n_steps == 0)
@@ -528,7 +541,15 @@ class AmbiDOALightningModule(pl.LightningModule):
         # train/base_loss = task loss only — apples-to-apples with val_loss.
         batch_size = x_batch.size(0)
         self.log("train/loss", combined_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log("train/base_loss", total_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        # train/base_loss uses the confidence-free count term when enabled so it
+        # stays comparable to val_loss and does not drift; the true gradient
+        # magnitude is train/loss. Falls back to the exact task loss otherwise.
+        base_loss_report = (
+            self.lambda_count * loss_cnt_thresh + self.lambda_pos * loss_pos
+            if self.thresholded_loss_report
+            else total_loss
+        )
+        self.log("train/base_loss", base_loss_report, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         self.log("train/loss_count", loss_cnt, on_step=True, on_epoch=True, batch_size=batch_size)
         self.log("train/loss_pos", loss_pos, on_step=True, on_epoch=True, batch_size=batch_size)
         if self.mean_teacher_weight > 0:
@@ -557,12 +578,20 @@ class AmbiDOALightningModule(pl.LightningModule):
         self._val_step_time_count = 0
         self._val_step_ms_epoch = None
 
-    def validation_step(self, batch, batch_idx):
-        """Validation batch pass without optimization.
+    def on_test_epoch_start(self):
+        """Reset the (shared) eval accumulators before the held-out test pass."""
+        self._reset_validation_accumulators()
+        self._val_step_time_sum = 0.0
+        self._val_step_time_count = 0
+        self._val_step_ms_epoch = None
 
-        Uses EMA teacher weights when available — same weights that were used
-        during the last training step's teacher forward — without the overhead
-        of weight swapping into self.model.
+    def _eval_step(self, batch, stage):
+        """Shared validation/test batch pass (no optimization).
+
+        `stage` is "val" or "test": it only selects the log-key prefix and, for
+        val, the slash-free checkpoint-monitor aliases. Forward, loss, and metric
+        accumulation are identical, so val and test report the same numbers on
+        their respective splits. Uses the EMA teacher when available.
         """
         t0 = perf_counter() if self.log_timing else None
         x_val, y_count, mask, y_pos = batch
@@ -572,7 +601,7 @@ class AmbiDOALightningModule(pl.LightningModule):
         pred_count, pred_pos = eval_model(x_val)
 
         # Keep loss function identical to training for consistent model selection.
-        loss, loss_cnt, loss_pos = multi_source_loss(
+        _val_out = multi_source_loss(
             pred_count,
             y_count,
             pred_pos,
@@ -585,15 +614,15 @@ class AmbiDOALightningModule(pl.LightningModule):
             count_label_smoothing=self.count_label_smoothing,
             count_per_k_weights=self.count_per_k_weights,
             return_components=True,
+            return_thresholded_count=self.thresholded_loss_report,
         )
+        if self.thresholded_loss_report:
+            loss, loss_cnt, loss_pos, loss_cnt_thresh = _val_out
+        else:
+            loss, loss_cnt, loss_pos = _val_out
+            loss_cnt_thresh = None
 
-        # Log validation losses on epoch boundaries (less noisy than per-step logs).
-        # Keep a single loss key (`val_loss`) to avoid duplicate CSV columns.
         batch_size = x_val.size(0)
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch_size)
-        self.log("val/loss_count", loss_cnt, on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, batch_size=batch_size)
-
         max_sources = int(self.model.max_sources)
 
         # Collapse per-slot logits to a scalar predicted count before metrics so
@@ -609,6 +638,30 @@ class AmbiDOALightningModule(pl.LightningModule):
         pred_count_cpu = pred_count_scalar.reshape(-1).cpu()
         true_count_cpu = y_count.detach().reshape(-1).cpu()
         count_abs_err_cpu = (pred_count_cpu - true_count_cpu).abs()
+
+        # --- Reported val_loss (diagnostic only) ---
+        # val_loss is NOT the gradient target and NOT the checkpoint/early-stop
+        # monitor (that is val_angular_error_deg), so its definition is free to
+        # optimize for readability without touching model performance.
+        #   * default: the exact validation task loss (count BCE + position cosine).
+        #     The count BCE drifts UP under confidence miscalibration even while
+        #     count_mae / angular improve.
+        #   * thresholded: swap the confidence-sensitive count BCE for the
+        #     confidence-free thresholded BCE (same targets, predictions snapped to
+        #     the label-smoothing confidence). Same BCE scale — comparable to
+        #     train/base_loss — but it moves only with the hard decisions, so no
+        #     up-drift. The raw BCE count term is still logged as val/loss_count.
+        if self.thresholded_loss_report:
+            val_loss_value = self.lambda_pos * loss_pos + self.lambda_count * loss_cnt_thresh
+        else:
+            val_loss_value = loss
+
+        # Log validation losses on epoch boundaries (less noisy than per-step logs).
+        # Keep a single loss key (`val_loss`) to avoid duplicate CSV columns.
+        self.log(f"{stage}_loss", val_loss_value, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        self.log(f"{stage}/loss_count", loss_cnt, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f"{stage}/loss_pos", loss_pos, on_step=False, on_epoch=True, batch_size=batch_size)
+
         self._val_count_err_sum += float(count_abs_err_cpu.sum().item())
         self._val_count_sample_sum += int(count_abs_err_cpu.numel())
 
@@ -646,8 +699,20 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         return loss
 
-    def on_validation_epoch_end(self):
-        """Compute full-epoch validation metrics and print concise diagnostics."""
+    def validation_step(self, batch, batch_idx):
+        """Validation batch pass (EMA teacher when available)."""
+        return self._eval_step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        """Held-out test batch pass — same metrics as validation, on the test split."""
+        return self._eval_step(batch, "test")
+
+    def _finalize_eval(self, stage):
+        """Aggregate the streaming eval metrics and print a concise summary.
+
+        `stage` in {"val", "test"} selects the log-key prefix, the val-only
+        checkpoint-monitor aliases / timing key, and the printed label.
+        """
         if self._val_count_sample_sum <= 0:
             return
 
@@ -660,15 +725,16 @@ class AmbiDOALightningModule(pl.LightningModule):
         hist = self._val_pred_count_hist.tolist()
 
         # Surface key metrics to progress bar and logger.
-        self.log("val/angular_error_deg", mean_angular_error, prog_bar=True)
-        self.log("val/count_mae", mean_count_error, prog_bar=True)
-        # Slash-free aliases so ModelCheckpoint.filename can interpolate the
-        # monitor value without producing nested subdirectories. Keys in
-        # ModelCheckpoint filename templates must not contain '/'.
-        self.log("val_angular_error_deg", mean_angular_error)
-        self.log("val_count_mae", mean_count_error)
+        self.log(f"{stage}/angular_error_deg", mean_angular_error, prog_bar=True)
+        self.log(f"{stage}/count_mae", mean_count_error, prog_bar=True)
+        if stage == "val":
+            # Slash-free aliases so ModelCheckpoint.filename can interpolate the
+            # monitor value without producing nested subdirectories. Keys in
+            # ModelCheckpoint filename templates must not contain '/'.
+            self.log("val_angular_error_deg", mean_angular_error)
+            self.log("val_count_mae", mean_count_error)
 
-        if self.log_timing and self._val_step_time_count > 0:
+        if stage == "val" and self.log_timing and self._val_step_time_count > 0:
             self._val_step_ms_epoch = self._val_step_time_sum / float(self._val_step_time_count)
             self.log("perf/val_step_ms", self._val_step_ms_epoch, prog_bar=False)
 
@@ -686,9 +752,10 @@ class AmbiDOALightningModule(pl.LightningModule):
                 ang_k = float("nan")
             per_k_lines.append(f"k={k}: N={n_k}, ang={ang_k:.1f}, cntMAE={cnt_mae_k:.2f}")
 
-        # Keep human-readable validation summary in terminal output.
+        # Keep human-readable summary in terminal output.
+        label = "Validation" if stage == "val" else "Test"
         summary = (
-            f"Validation | angular_error={mean_angular_error:.2f} deg | "
+            f"{label} | angular_error={mean_angular_error:.2f} deg | "
             f"count_mae={mean_count_error:.3f} | pred_count_hist={hist}"
         )
         self._print_and_append_txt(summary)
@@ -697,6 +764,14 @@ class AmbiDOALightningModule(pl.LightningModule):
             self._print_and_append_txt("Per-k:")
             for line in per_k_lines:
                 self._print_and_append_txt(f"   {line}")
+
+    def on_validation_epoch_end(self):
+        """Compute full-epoch validation metrics and print concise diagnostics."""
+        self._finalize_eval("val")
+
+    def on_test_epoch_end(self):
+        """Compute full-epoch metrics on the held-out test split."""
+        self._finalize_eval("test")
 
     def on_train_epoch_end(self):
         """Write concise epoch loss summary to TXT after epoch metrics are finalized."""

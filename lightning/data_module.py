@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataset import AmbiDOADataset
-from train_utils import split_by_file
+from train_utils import split_by_file, split_by_file_train_val_test
 from utils_device import dataloader_kwargs_for
 
 
@@ -85,6 +85,9 @@ class AmbiDOADataModule(pl.LightningDataModule):
             )
         )
         self.val_ratio = float(self.config.get("val_ratio", 0.2))
+        # Optional held-out test split (files disjoint from train/val) for
+        # unbiased final evaluation. 0.0 disables it (backward-compatible).
+        self.test_ratio = float(self.config.get("test_ratio", 0.0))
         self.split_seed = int(self.config.get("split_seed", 42))
 
         # Keep the current dataset contract and allow optional overrides in config.json.
@@ -108,6 +111,7 @@ class AmbiDOADataModule(pl.LightningDataModule):
 
         self.train_set = None
         self.val_set = None
+        self.test_set = None
         self.run_txt_log_name = run_txt_log_name
         self.run_txt_timestamp = bool(run_txt_timestamp)
         self._run_txt_log_path = None
@@ -177,20 +181,41 @@ class AmbiDOADataModule(pl.LightningDataModule):
                 f"({kept}/{total} files, seed={self.dataset_kwargs['subsample_seed']})"
             )
 
-        # Split by source file identity to avoid leakage across windows.
-        self.train_set, self.val_set = split_by_file(
-            dataset,
-            val_ratio=self.val_ratio,
-            seed=self.split_seed,
-            # Lightning writes run-scoped TXT logs itself; avoid legacy global log file here.
-            log_fn=None,
-        )
+        # Split by source file identity to avoid leakage across windows. When a
+        # test_ratio is configured, carve a held-out test split (files disjoint
+        # from train/val) for unbiased final evaluation.
+        if self.test_ratio > 0:
+            self.train_set, self.val_set, self.test_set = split_by_file_train_val_test(
+                dataset,
+                val_ratio=self.val_ratio,
+                test_ratio=self.test_ratio,
+                seed=self.split_seed,
+                log_fn=None,
+            )
+        else:
+            self.train_set, self.val_set = split_by_file(
+                dataset,
+                val_ratio=self.val_ratio,
+                seed=self.split_seed,
+                # Lightning writes run-scoped TXT logs itself; avoid legacy global log file here.
+                log_fn=None,
+            )
 
         train_frames = len(self.train_set)
         val_frames = len(self.val_set)
         train_files = self._count_unique_files(self.train_set)
         val_files = self._count_unique_files(self.val_set)
-        if train_files is not None and val_files is not None:
+        if self.test_set is not None:
+            test_frames = len(self.test_set)
+            test_files = self._count_unique_files(self.test_set)
+            if None not in (train_files, val_files, test_files):
+                line = (
+                    f"Liczba ramek (train/val/test): {train_frames} / {val_frames} / {test_frames}  | "
+                    f"pliki: {train_files} / {val_files} / {test_files}"
+                )
+            else:
+                line = f"Liczba ramek (train/val/test): {train_frames} / {val_frames} / {test_frames}"
+        elif train_files is not None and val_files is not None:
             line = (
                 f"Liczba ramek (train/val): {train_frames} / {val_frames}  | "
                 f"pliki: {train_files} / {val_files}"
@@ -227,6 +252,17 @@ class AmbiDOADataModule(pl.LightningDataModule):
         """Validation DataLoader with deterministic order (no shuffle)."""
         return DataLoader(
             self.val_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            **self._loader_kwargs(split="val"),
+        )
+
+    def test_dataloader(self):
+        """Held-out test DataLoader (deterministic order). None when no test split."""
+        if self.test_set is None:
+            return None
+        return DataLoader(
+            self.test_set,
             batch_size=self.batch_size,
             shuffle=False,
             **self._loader_kwargs(split="val"),

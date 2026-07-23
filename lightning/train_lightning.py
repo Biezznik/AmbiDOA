@@ -103,6 +103,9 @@ def build_model_kwargs(config):
         "stochastic_depth": float(config.get("stochastic_depth", 0.0)),
         "count_loss_type": str(config.get("count_loss_type", "regression")),
         "count_head_hidden": bool(config.get("count_head_hidden", True)),
+        "use_query_decoder": bool(config.get("use_query_decoder", False)),
+        "decoder_layers": int(config.get("decoder_layers", 3)),
+        "decoder_dropout": float(config.get("decoder_dropout", 0.1)),
     }
 
 
@@ -230,6 +233,7 @@ def main():
         config["use_ema"] = False
         config["mean_teacher_weight"] = 0.0
         config["stochastic_depth"] = 0.0
+        config["decoder_dropout"] = 0.0
         data_module = _SyntheticDataModule(config)
     else:
         data_module = AmbiDOADataModule(
@@ -254,6 +258,7 @@ def main():
         count_consistency_weight=float(config.get("count_consistency_weight", 0.0)),
         count_consistency_cos_threshold=float(config.get("count_consistency_cos_threshold", 0.5)),
         count_per_k_weights=config.get("count_per_k_weights"),
+        thresholded_loss_report=bool(config.get("thresholded_loss_report", False)),
         use_scheduler=bool(config.get("use_scheduler", True)),
         weight_decay=float(config.get("weight_decay", 0.0)),
         warmup_steps=config.get("warmup_steps"),
@@ -432,6 +437,15 @@ def main():
     else:
         # `ckpt_path` is non-None only for full-state resume in training mode.
         trainer.fit(lit_model, datamodule=data_module, ckpt_path=ckpt_path_for_fit)
+
+        # Held-out test evaluation on the best checkpoint — unbiased final metrics
+        # on files disjoint from train/val. Runs only when a test split was
+        # configured (test_ratio > 0) and a checkpoint exists (non-dev run).
+        if not dev_mode_active and float(config.get("test_ratio", 0.0)) > 0:
+            try:
+                trainer.test(lit_model, datamodule=data_module, ckpt_path="best")
+            except Exception as exc:
+                print(f"[TEST][WARN] Held-out test evaluation skipped: {exc}")
 
     # 8) When overfit_dev_run is active, run the single-batch overfit sanity check.
     # This verifies the pipeline can drive loss to zero on a fixed batch — a

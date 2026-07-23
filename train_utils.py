@@ -147,6 +147,28 @@ def _match_one_sample(pred_S3, true_S3, mask_S):
 # --------------------------- Main multi-source loss ---------------------------
 
 
+def _thresholded_count_bce(logits, targets, count_label_smoothing, weight=None):
+    """BCE of the count/presence targets against THRESHOLDED predictions.
+
+    Snaps every predicted probability to a fixed confidence level (the label-
+    smoothing level, or 0.05 when smoothing is off) according to the >0.5
+    decision, then computes BCE against the same targets. This removes the
+    confidence degree of freedom from the reported count loss: it moves only with
+    the hard presence/ordinal decisions, not with calibration — so it does not
+    exhibit the BCE confidence up-drift, while staying on the same scale and units
+    as the real count BCE. Detached — intended for logging only, never gradient.
+    """
+    snap_eps = max(float(count_label_smoothing), 0.05)
+    with torch.no_grad():
+        p = torch.sigmoid(logits.detach())
+        p_snap = torch.where(
+            p > 0.5,
+            p.new_full((), 1.0 - snap_eps),
+            p.new_full((), snap_eps),
+        )
+        return F.binary_cross_entropy(p_snap, targets, weight=weight)
+
+
 def multi_source_loss(
     pred_count,
     true_count,
@@ -161,6 +183,7 @@ def multi_source_loss(
     count_per_k_weights: Optional[torch.Tensor] = None,
     return_components: bool = False,
     return_matches: bool = False,
+    return_thresholded_count: bool = False,
 ):
     """
     Weighted multi-task loss:
@@ -193,9 +216,17 @@ def multi_source_loss(
     B, S, _ = pred_pos.shape
     match_idx_batch = _match_batch(pred_pos, true_pos, mask)
 
+    # Optional confidence-free ("thresholded") count loss for reporting. Filled in
+    # per mode below only when requested; stays None otherwise.
+    loss_count_thresh = None
+
     if count_loss_type == "regression":
         # SmoothL1 is more robust than plain MSE on the scalar target.
         loss_count = nn.SmoothL1Loss(beta=1.0)(pred_count.squeeze(), true_count.squeeze().float())
+        if return_thresholded_count:
+            # SmoothL1 is not confidence-sensitive, so it does not drift; the
+            # thresholded report is the same value.
+            loss_count_thresh = loss_count
     elif count_loss_type == "ordinal":
         # Ordinal cumulative encoding: head j predicts P(k >= j+1) via BCE.
         # Targets shape [B, max_sources]: targets[b, j] = 1 iff true_count[b] >= j+1.
@@ -216,8 +247,16 @@ def multi_source_loss(
             loss_count = F.binary_cross_entropy_with_logits(
                 pred_count, targets, weight=sample_weight
             )
+            if return_thresholded_count:
+                loss_count_thresh = _thresholded_count_bce(
+                    pred_count, targets, count_label_smoothing, weight=sample_weight
+                )
         else:
             loss_count = F.binary_cross_entropy_with_logits(pred_count, targets)
+            if return_thresholded_count:
+                loss_count_thresh = _thresholded_count_bce(
+                    pred_count, targets, count_label_smoothing
+                )
     elif count_loss_type == "presence":
         # Per-slot presence logits. Target[b, s] = 1 iff slot s was PI-matched to
         # a real GT source in sample b, else 0. Structurally couples the count
@@ -243,6 +282,10 @@ def multi_source_loss(
             eps = float(count_label_smoothing)
             presence_target = presence_target * (1.0 - 2.0 * eps) + eps
         loss_count = F.binary_cross_entropy_with_logits(pred_count, presence_target)
+        if return_thresholded_count:
+            loss_count_thresh = _thresholded_count_bce(
+                pred_count, presence_target, count_label_smoothing
+            )
     else:
         raise ValueError(
             f"Unsupported count_loss_type='{count_loss_type}'. "
@@ -278,6 +321,13 @@ def multi_source_loss(
     loss_pos = loss_pos_sum / (float(active_sum) + 1e-8)
     total_loss = lambda_count * loss_count + lambda_pos * loss_pos
 
+    if return_thresholded_count:
+        # Confidence-free count loss appended for drift-free base_loss/val_loss
+        # reporting. Used together with return_components.
+        if return_matches:
+            return (total_loss, loss_count.detach(), loss_pos.detach(),
+                    match_idx_batch, loss_count_thresh.detach())
+        return total_loss, loss_count.detach(), loss_pos.detach(), loss_count_thresh.detach()
     if return_components and return_matches:
         return total_loss, loss_count.detach(), loss_pos.detach(), match_idx_batch
     if return_components:
@@ -512,6 +562,47 @@ def split_by_file(dataset, val_ratio=0.2, seed=42, log_fn=log_print):
             f"{len(unique_files) - n_val_files} / {n_val_files}"
         )
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+def split_by_file_train_val_test(dataset, val_ratio=0.2, test_ratio=0.1, seed=42, log_fn=log_print):
+    """File-level 3-way split: train / val / test, with no window leakage.
+
+    All windows from one audio file stay within a single split. The test files
+    are carved out first, then val, then the remainder is train — so a held-out
+    test set (files disjoint from both train and val) is available for unbiased
+    final evaluation. Deterministic under `seed`.
+    """
+    file_ids = [w["audio_path"] for w in dataset.windows]
+    files = np.array(file_ids)
+    indices = np.arange(len(dataset))
+    unique_files = np.unique(files)
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_files)
+    n_files = len(unique_files)
+    n_test_files = int(n_files * test_ratio)
+    n_val_files = int(n_files * val_ratio)
+    test_files = set(unique_files[:n_test_files])
+    val_files = set(unique_files[n_test_files:n_test_files + n_val_files])
+
+    in_test = np.array([f in test_files for f in files])
+    in_val = np.array([f in val_files for f in files])
+    test_idx = indices[in_test]
+    val_idx = indices[in_val]
+    train_idx = indices[~(in_test | in_val)]
+
+    from torch.utils.data import Subset
+
+    if log_fn is not None:
+        log_fn(
+            f"Frames (train/val/test): {len(train_idx)} / {len(val_idx)} / {len(test_idx)} | "
+            f"files: {n_files - n_val_files - n_test_files} / {n_val_files} / {n_test_files}"
+        )
+    return (
+        Subset(dataset, train_idx),
+        Subset(dataset, val_idx),
+        Subset(dataset, test_idx),
+    )
 
 
 # --------------------------- Non-PI angular error ---------------------------

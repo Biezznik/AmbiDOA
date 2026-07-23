@@ -45,6 +45,29 @@
   //   the head, reinitializing it from scratch.
   "count_head_hidden": true,
 
+  // Readout A/B switch (quick-revert). This replaces ONLY the readout stage;
+  // the encoder and the (presence, positions) output contract are unchanged, so
+  // loss / PI-matching / EMA / mean-teacher / R-Drop are untouched.
+  //   false (default) -> A: temporal mean-pool -> pooled presence + positions
+  //          heads. Bit-identical to the pre-decoder baseline.
+  //   true -> B: query decoder. max_sources learned slots cross-attend the
+  //          encoder output (and self-attend to de-duplicate) and predict a
+  //          per-slot direction + presence logit — lifts the mean-pool
+  //          single-vector bottleneck on high source counts.
+  //   Presence-only: requires count_loss_type = "presence" (rejected otherwise).
+  //   Checkpoint compatibility: toggling this changes the readout parameter set
+  //   (source_queries / decoder / slot heads vs pooled heads), so decoder-on and
+  //   decoder-off checkpoints are NOT weight-compatible — strict=False loaders
+  //   skip and reinitialize the readout.
+  //   Training note: the decoder is DETR-style and less LR-tolerant than the
+  //   mean-pool head — use grad_clip > 0 (it diverges unclipped at high LR), and
+  //   expect slower convergence (more epochs / a gentler LR). The overfit sanity
+  //   test auto-softens its LR, enables clipping, and raises its step budget when
+  //   this is true.
+  "use_query_decoder": false,
+  "decoder_layers": 3,          // query-decoder depth (used only when use_query_decoder=true)
+  "decoder_dropout": 0.1,       // dropout inside the decoder + slot heads, independent of encoder `dropout`
+
   // -------------------- Loss / Metrics --------------------
   // count_loss_type:
   //   "regression" — single scalar logit + SmoothL1 (legacy; can collapse toward
@@ -73,6 +96,22 @@
   //   typical starting point; must be in [0.0, 0.5).
   //   Optimal BCE floor becomes -(1-ε)·log(1-ε) - ε·log(ε) (≈ 0.20 at ε=0.05).
   "count_label_smoothing": 0.0,
+
+  // thresholded_loss_report (diagnostic/logging only — no effect on training,
+  // checkpoint selection, or early stopping, all of which key off
+  // val_angular_error_deg):
+  //   false (default) -> train/base_loss and val_loss are the exact task loss
+  //          (count BCE + position cosine). The count BCE up-drifts under
+  //          confidence miscalibration even while count_mae / angular_error
+  //          keep improving.
+  //   true  -> the count term in BOTH train/base_loss and val_loss is computed
+  //          with THRESHOLDED predictions (probabilities snapped to the
+  //          label-smoothing confidence by the >0.5 decision) instead of the raw
+  //          probabilities. Same BCE scale/units — so base_loss and val_loss stay
+  //          comparable — but the count term moves only with the hard decisions,
+  //          so it shows no confidence up-drift. train/loss still logs the true
+  //          gradient magnitude; the raw BCE count term is still at val/loss_count.
+  "thresholded_loss_report": false,
 
   // Count-from-positions consistency (Strategy #3, regression/ordinal only):
   //   Aux loss tying pred_count to the number of PI-matched position slots
