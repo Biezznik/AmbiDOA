@@ -1,0 +1,46 @@
+count_consistency_cos_threshold: 0.5
+count_consistency_weight: 0.0
+count_label_smoothing: 0.15
+count_loss_type: presence
+count_per_k_weights: null
+ema_decay: 0.999
+ema_update_after_step: 100
+grad_accum_steps: 2
+grad_clip: 1.0
+lambda_count: 1.5
+lambda_pos: 5.0
+log_grad_norm: true
+log_timing: false
+lr: 3.0e-05
+mean_teacher_weight: 0.5
+model_kwargs:
+  count_head_hidden: false
+  count_loss_type: presence
+  d_model: 192
+  decoder_dropout: 0.15
+  decoder_layers: 3
+  dim_feedforward: 1024
+  dropout: 0.4
+  gradient_checkpointing: false
+  input_len: 2000
+  max_sources: 12
+  n_channels: 16
+  nhead: 8
+  num_layers: 8
+  share_encoder_weights: false
+  stochastic_depth: 0.2
+  use_posenc: true
+  use_query_decoder: true
+pos_loss_type: cosine
+presence_threshold: 0.5
+rdrop_weight: 0.5
+regularization_every_n_steps: 1
+run_txt_log_name: log_AmbiDOA_2026-10-13.txt
+run_txt_timestamp: true
+thresholded_loss_report: true
+timing_cuda_sync: false
+timing_log_every_n_steps: 0
+use_ema: true
+use_scheduler: true
+warmup_steps: 300
+weight_decay: 0.15

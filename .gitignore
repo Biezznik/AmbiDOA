@@ -23,12 +23,28 @@ macvenv/
 .vscode/
 .idea/
 
-# Training artifacts
-Logs/
-models/
+# Training artifacts (ignored by default)
+Logs/*
+models/*
 *.ckpt
 *.pth
 *.pt
+
+# ...except these specific runs, shared in the repo. These negations MUST stay
+# after the rules above (later patterns win), so they also override the *.ckpt /
+# *.pth extension ignores for files inside these dirs.
+!Logs/2026_10_01/
+!Logs/2026_10_13/
+!models/2026_10_01/
+!models/2026_10_13/
+!Logs/2026_10_01/**
+!Logs/2026_10_13/**
+!models/2026_10_01/**
+!models/2026_10_13/**
+
+# ...but not the resume-snapshot last.ckpt (redundant with the best checkpoint).
+models/2026_10_01/last.ckpt
+models/2026_10_13/last.ckpt
 
 # Legacy local-only folders from prior ignore list
 bnc02/
