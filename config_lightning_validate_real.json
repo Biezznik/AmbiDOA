@@ -1,0 +1,97 @@
+{
+  "_comment": "Run-ready VALIDATE-ONLY config for the best decoder model (2026_07_17, val_ang 7.99 deg) on the real dataset. Architecture mirrors the checkpoint exactly (read from the ckpt state_dict). ONLY edit the two FILL_ME paths under 'data'. Run: python lightning/train_lightning.py --config config_lightning_validate_real.json --validate-only",
+  "data": {
+    "manifest_path": "D:\\pm\\bb\\Real_Dataset_Frame_Push\\Real_Dataset_Frame_Push\\103_Whole_Manifest_ACN-SN3D_Real_Dataset.json",
+    "audio_dir": "D:\\pm\\bb\\Real_Dataset_Frame_Push\\Real_Dataset_Frame_Push",
+    "sr": 11025,
+    "window_len_ms": 272,
+    "dbfs_threshold": -80.0,
+    "batch_size": 64,
+    "num_workers": 4,
+    "train_num_workers": 0,
+    "val_num_workers": 4,
+    "val_ratio": 1.0,
+    "test_ratio": 0.0,
+    "split_seed": 42
+  },
+  "model": {
+    "n_channels": 16,
+    "d_model": 192,
+    "nhead": 8,
+    "num_layers": 8,
+    "dim_feedforward": 1024,
+    "max_sources": 12,
+    "use_posenc": true,
+    "dropout": 0.4,
+    "stochastic_depth": 0.2,
+    "gradient_checkpointing": false,
+    "compile_model": false,
+    "compile_backend": "aot-eager",
+    "decoder_layers": 3,
+    "decoder_dropout": 0.15
+  },
+  "loss": {
+    "lambda_count": 1.5,
+    "lambda_pos": 5.0,
+    "count_label_smoothing": 0.15,
+    "thresholded_loss_report": true
+  },
+  "optimizer": {
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "use_scheduler": false,
+    "warmup_steps": null,
+    "grad_clip": 0.0,
+    "accumulate_grad_batches": 1
+  },
+  "ema": {
+    "use_ema": false,
+    "ema_decay": 0.9995,
+    "ema_update_after_step": 400,
+    "mean_teacher_weight": 0.0
+  },
+  "regularization": {
+    "rdrop_weight": 0.0,
+    "regularization_every_n_steps": 1
+  },
+  "finetune": {
+    "finetune_from": "models/2026_07_17/best_ema_model.pth",
+    "finetune_lr": 0.0001,
+    "reset_optimizer": true,
+    "freeze_n_encoder_layers": 0,
+    "freeze_posenc": false
+  },
+  "training": {
+    "num_epochs": 1,
+    "early_stopping_patience": 0,
+    "save_top_k": 1,
+    "save_last": false,
+    "checkpoint_monitor": "val_angular_error_deg",
+    "checkpoint_monitor_mode": "min"
+  },
+  "hardware": {
+    "require_cuda": true,
+    "precision": "32-true",
+    "matmul_precision": "high",
+    "deterministic": false
+  },
+  "logging": {
+    "log_lr": false,
+    "log_grad_norm": false,
+    "log_every_n_steps": 50,
+    "run_txt_timestamp": true,
+    "run_txt_log_name": null,
+    "log_timing": false,
+    "timing_log_every_n_steps": 0,
+    "timing_cuda_sync": false
+  },
+  "debug": {
+    "fast_dev_run": false,
+    "overfit_dev_run": false,
+    "num_sanity_val_steps": 0,
+    "overfit_test_epochs": 50,
+    "overfit_test_threshold": 0.2,
+    "overfit_test_batch_size": 32,
+    "subsample_pct": 100
+  }
+}

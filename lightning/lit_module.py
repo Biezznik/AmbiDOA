@@ -30,7 +30,6 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
-import torch.nn.functional as F
 
 try:
     import lightning.pytorch as pl
@@ -48,7 +47,6 @@ from train_utils import (
     angular_error_stats_PI,
     build_warmup_cosine_scheduler,
     multi_source_loss,
-    position_consistency_count_loss,
 )
 
 
@@ -67,15 +65,11 @@ class AmbiDOALightningModule(pl.LightningModule):
         self,
         model_kwargs=None,
         lr=5e-4,
-        count_loss_type="regression",
         lambda_count=0.1,
         lambda_pos=2.5,
-        pos_loss_type="cosine",
         count_label_smoothing=0.0,
-        count_consistency_weight=0.0,
-        count_consistency_cos_threshold=0.5,
-        count_per_k_weights=None,
         thresholded_loss_report=False,
+        presence_threshold=0.5,
         use_scheduler=True,
         weight_decay=0.0,
         warmup_steps=None,
@@ -107,58 +101,32 @@ class AmbiDOALightningModule(pl.LightningModule):
             use_posenc=True,
             dropout=0.003,
             stochastic_depth=0.0,
-            count_loss_type=str(count_loss_type),
-            count_head_hidden=True,
         )
         if model_kwargs:
             model_defaults.update(model_kwargs)
-        # Ensure model's count head matches the loss type (kwargs may override default).
-        model_defaults["count_loss_type"] = str(count_loss_type)
 
-        # Core AmbiDOA transformer model.
+        # Core AmbiDOA transformer model (query decoder, per-slot presence).
         self.model = AmbiTransformerDOA(**model_defaults)
 
         # Loss and optimization hyperparameters.
         self.lr = float(lr)
-        self.count_loss_type = str(count_loss_type)
         self.lambda_count = float(lambda_count)
         self.lambda_pos = float(lambda_pos)
-        self.pos_loss_type = pos_loss_type
         self.count_label_smoothing = float(count_label_smoothing)
-        self.count_consistency_weight = float(count_consistency_weight)
-        self.count_consistency_cos_threshold = float(count_consistency_cos_threshold)
         # Diagnostic-only: report train/base_loss and val_loss with a
         # confidence-free ("thresholded") count term so they stay on the same BCE
         # scale (comparable to each other) but do not exhibit the count-BCE
         # confidence up-drift. Affects logging only — not the gradient target and
         # not the checkpoint/early-stop monitor (val_angular_error_deg).
         self.thresholded_loss_report = bool(thresholded_loss_report)
+        # Inference-only decision threshold for deriving the integer source count
+        # from presence/ordinal logits: count = sum_j 1{sigmoid(logit_j) > thr}.
+        # Affects count_mae / pred_count_hist only — NOT the loss, gradient, or
+        # weights, so it can be swept post-hoc on any trained checkpoint.
+        self.presence_threshold = float(presence_threshold)
+        if not (0.0 < self.presence_threshold < 1.0):
+            raise ValueError("presence_threshold must be in (0, 1).")
 
-        # Optional per-k class balance weights for the ordinal count BCE.
-        # Registered as a non-persistent buffer so it follows the module across
-        # devices without polluting checkpoints; None => baseline (no reweighting).
-        if count_per_k_weights is not None:
-            weights_list = [float(w) for w in count_per_k_weights]
-            expected_len = int(model_defaults["max_sources"]) + 1
-            if len(weights_list) != expected_len:
-                raise ValueError(
-                    f"count_per_k_weights must have length max_sources + 1 = {expected_len}, "
-                    f"got {len(weights_list)}."
-                )
-            if any(w < 0.0 for w in weights_list):
-                raise ValueError("count_per_k_weights entries must be non-negative.")
-            if self.count_loss_type != "ordinal":
-                raise ValueError(
-                    "count_per_k_weights is only meaningful in 'ordinal' mode; "
-                    "leave it null/omitted for 'regression' or 'presence'."
-                )
-            self.register_buffer(
-                "count_per_k_weights",
-                torch.tensor(weights_list, dtype=torch.float32),
-                persistent=False,
-            )
-        else:
-            self.count_per_k_weights = None
         self.use_scheduler = bool(use_scheduler)
         self.weight_decay = float(weight_decay)
         self.warmup_steps = warmup_steps
@@ -180,27 +148,8 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         if not (0.0 < self.ema_decay < 1.0):
             raise ValueError("ema_decay must be in (0, 1).")
-        if self.count_loss_type not in ("regression", "ordinal", "presence"):
-            raise ValueError(
-                f"Unsupported count_loss_type='{self.count_loss_type}'. "
-                "Expected 'regression', 'ordinal', or 'presence'."
-            )
         if not (0.0 <= self.count_label_smoothing < 0.5):
             raise ValueError("count_label_smoothing must be in [0.0, 0.5).")
-        if self.count_consistency_weight < 0.0:
-            raise ValueError("count_consistency_weight must be >= 0.")
-        if not (-1.0 <= self.count_consistency_cos_threshold <= 1.0):
-            raise ValueError("count_consistency_cos_threshold must be in [-1.0, 1.0].")
-        if self.count_label_smoothing > 0 and self.count_loss_type not in ("ordinal", "presence"):
-            raise ValueError(
-                "count_label_smoothing > 0 is only meaningful in 'ordinal' or 'presence' mode; "
-                "set it to 0.0 for 'regression'."
-            )
-        if self.count_loss_type == "presence" and self.count_consistency_weight > 0:
-            raise ValueError(
-                "count_consistency_weight is undefined in 'presence' mode; the presence head "
-                "does not produce a monotone count-distribution to be smoothed. Set it to 0.0."
-            )
         if self.mean_teacher_weight > 0 and not self.use_ema:
             raise ValueError("mean_teacher_weight > 0 requires use_ema=True.")
 
@@ -433,29 +382,23 @@ class AmbiDOALightningModule(pl.LightningModule):
         # --- Student forward pass 1 ---
         pred_count, pred_pos = self.model(x_batch)
 
-        # --- Task loss (count + PI position) ---
-        # Also receive the PI match indices so the consistency aux loss can reuse
-        # them — avoids a second Hungarian solve per training step.
+        # --- Task loss (per-slot presence count + PI position) ---
         _loss_out = multi_source_loss(
             pred_count,
             y_count,
             pred_pos,
             y_pos,
             mask,
-            count_loss_type=self.count_loss_type,
             lambda_count=self.lambda_count,
             lambda_pos=self.lambda_pos,
-            pos_loss_type=self.pos_loss_type,
             count_label_smoothing=self.count_label_smoothing,
-            count_per_k_weights=self.count_per_k_weights,
             return_components=True,
-            return_matches=True,
             return_thresholded_count=self.thresholded_loss_report,
         )
         if self.thresholded_loss_report:
-            total_loss, loss_cnt, loss_pos, match_idx_batch, loss_cnt_thresh = _loss_out
+            total_loss, loss_cnt, loss_pos, loss_cnt_thresh = _loss_out
         else:
-            total_loss, loss_cnt, loss_pos, match_idx_batch = _loss_out
+            total_loss, loss_cnt, loss_pos = _loss_out
             loss_cnt_thresh = None
 
         # --- Mean Teacher and R-Drop (applied every N steps to reduce compute) ---
@@ -469,27 +412,11 @@ class AmbiDOALightningModule(pl.LightningModule):
         if apply_regularization and self.rdrop_weight > 0:
             rdrop_loss = self._rdrop_loss(pred_count, pred_pos, x_batch)
 
-        # --- Count-from-positions consistency (Strategy #3) ---
-        # Ties pred_count to the number of well-localized matched slots so the
-        # count head can't claim sources the position head has not localized.
-        cc_loss = pred_count.new_tensor(0.0)
-        if self.count_consistency_weight > 0:
-            cc_loss = position_consistency_count_loss(
-                pred_count,
-                pred_pos,
-                y_pos,
-                mask,
-                count_loss_type=self.count_loss_type,
-                match_idx_batch=match_idx_batch,
-                cos_threshold=self.count_consistency_cos_threshold,
-            )
-
         # --- Combined loss for backward ---
         combined_loss = (
             total_loss
             + self.mean_teacher_weight * mt_loss
             + self.rdrop_weight * rdrop_loss
-            + self.count_consistency_weight * cc_loss
         )
 
         # Backpropagate scaled loss so effective gradient matches larger batch.
@@ -556,8 +483,6 @@ class AmbiDOALightningModule(pl.LightningModule):
             self.log("train/loss_mt", mt_loss, on_step=True, on_epoch=True, batch_size=batch_size)
         if self.rdrop_weight > 0:
             self.log("train/loss_rdrop", rdrop_loss, on_step=True, on_epoch=True, batch_size=batch_size)
-        if self.count_consistency_weight > 0:
-            self.log("train/loss_cc", cc_loss, on_step=True, on_epoch=True, batch_size=batch_size)
 
         if self.log_timing and t0 is not None:
             if self.timing_cuda_sync and self.device.type == "cuda":
@@ -607,12 +532,9 @@ class AmbiDOALightningModule(pl.LightningModule):
             pred_pos,
             y_pos,
             mask,
-            count_loss_type=self.count_loss_type,
             lambda_count=self.lambda_count,
             lambda_pos=self.lambda_pos,
-            pos_loss_type=self.pos_loss_type,
             count_label_smoothing=self.count_label_smoothing,
-            count_per_k_weights=self.count_per_k_weights,
             return_components=True,
             return_thresholded_count=self.thresholded_loss_report,
         )
@@ -625,14 +547,11 @@ class AmbiDOALightningModule(pl.LightningModule):
         batch_size = x_val.size(0)
         max_sources = int(self.model.max_sources)
 
-        # Collapse per-slot logits to a scalar predicted count before metrics so
-        # the downstream histogram / per-k aggregation code stays identical.
-        # Ordinal:  k_pred = sum_j 1{ sigmoid(cum_logit_j) > 0.5 } (cumulative P(k>=j)).
-        # Presence: k_pred = sum_j 1{ sigmoid(slot_logit_j) > 0.5 } (per-slot active-slot count).
-        if self.count_loss_type in ("ordinal", "presence"):
-            pred_count_scalar = (torch.sigmoid(pred_count.detach()) > 0.5).sum(dim=-1).float()
-        else:
-            pred_count_scalar = pred_count.detach().reshape(-1)
+        # Collapse per-slot presence logits to a scalar predicted count before
+        # metrics: k_pred = sum_j 1{ sigmoid(slot_logit_j) > presence_threshold }.
+        pred_count_scalar = (
+            torch.sigmoid(pred_count.detach()) > self.presence_threshold
+        ).sum(dim=-1).float()
 
         # Count metrics and histogram (streaming, CPU side).
         pred_count_cpu = pred_count_scalar.reshape(-1).cpu()

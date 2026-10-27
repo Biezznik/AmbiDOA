@@ -1,0 +1,101 @@
+{
+  "_comment": "VALIDATE-ONLY test of the best model on LOCATA STATIC tasks (task1 single + task2 multi-static), em32->3rd-order ACN/SN3D ambiX. Time-aware per-window labels are auto-detected from the manifest's 'sources' tracks (label_mode=auto); empty (count=0) windows are skipped since the model never saw count=0. DOA labels carry ~9-10 deg frame uncertainty from the empirical em32<->OptiTrack calibration (R_cal), so angular errors below ~10 deg are not distinguishable from label-frame noise. Arch mirrors the 2026_10_13 real fine-tune checkpoint. finetune_from MUST be the EMA weights (the reported 5.44 deg val was EMA); extract models/2026_10_13/best_ema_model.pth from the .ckpt first, or swap to the ready models/2026_10_01/best_ema_model.pth (synthetic base) for a baseline. Run: python lightning/train_lightning.py --config config_lightning_locata_static.json --validate-only",
+  "data": {
+    "manifest_path": "D:\\pm\\bb\\Validation_Dataset\\Eigenmike_Encode\\Eval-Static-Batch\\locata_static_eval.json",
+    "audio_dir": "D:\\pm\\bb\\Validation_Dataset\\Eigenmike_Encode\\Eval-Static-Batch",
+    "sr": 8000,
+    "window_len_ms": 250,
+    "dbfs_threshold": -80.0,
+    "batch_size": 32,
+    "num_workers": 4,
+    "train_num_workers": 0,
+    "val_num_workers": 4,
+    "val_ratio": 1.0,
+    "test_ratio": 0.0,
+    "split_seed": 42,
+    "label_mode": "auto",
+    "window_active_frac": 0.5,
+    "skip_inactive_windows": true
+  },
+  "model": {
+    "n_channels": 16,
+    "d_model": 192,
+    "nhead": 8,
+    "num_layers": 8,
+    "dim_feedforward": 1024,
+    "max_sources": 12,
+    "use_posenc": true,
+    "dropout": 0.4,
+    "stochastic_depth": 0.2,
+    "gradient_checkpointing": false,
+    "compile_model": false,
+    "compile_backend": "aot-eager",
+    "decoder_layers": 3,
+    "decoder_dropout": 0.15
+  },
+  "loss": {
+    "lambda_count": 1.5,
+    "lambda_pos": 5.0,
+    "count_label_smoothing": 0.15,
+    "thresholded_loss_report": true,
+    "presence_threshold": 0.5
+  },
+  "optimizer": {
+    "lr": 0.0001,
+    "weight_decay": 0.1,
+    "use_scheduler": false,
+    "warmup_steps": null,
+    "grad_clip": 0.0,
+    "accumulate_grad_batches": 1
+  },
+  "ema": {
+    "use_ema": false,
+    "ema_decay": 0.999,
+    "ema_update_after_step": 100,
+    "mean_teacher_weight": 0.0
+  },
+  "regularization": {
+    "rdrop_weight": 0.0,
+    "regularization_every_n_steps": 1
+  },
+  "finetune": {
+    "finetune_from": "models/2026_10_13/best_ema_model.pth",
+    "finetune_lr": 0.0001,
+    "reset_optimizer": true,
+    "freeze_n_encoder_layers": 0,
+    "freeze_posenc": false
+  },
+  "training": {
+    "num_epochs": 1,
+    "early_stopping_patience": 0,
+    "save_top_k": 1,
+    "save_last": false,
+    "checkpoint_monitor": "val_angular_error_deg",
+    "checkpoint_monitor_mode": "min"
+  },
+  "hardware": {
+    "require_cuda": true,
+    "precision": "32-true",
+    "matmul_precision": "high",
+    "deterministic": false
+  },
+  "logging": {
+    "log_lr": false,
+    "log_grad_norm": false,
+    "log_every_n_steps": 50,
+    "run_txt_timestamp": true,
+    "run_txt_log_name": null,
+    "log_timing": false,
+    "timing_log_every_n_steps": 0,
+    "timing_cuda_sync": false
+  },
+  "debug": {
+    "fast_dev_run": false,
+    "overfit_dev_run": false,
+    "num_sanity_val_steps": 0,
+    "overfit_test_epochs": 50,
+    "overfit_test_threshold": 0.2,
+    "overfit_test_batch_size": 32,
+    "subsample_pct": 100
+  }
+}

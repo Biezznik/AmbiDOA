@@ -107,6 +107,12 @@ class AmbiDOADataModule(pl.LightningDataModule):
             max_sources=int(self.config.get("max_sources", 12)),
             subsample_pct=subsample_pct,
             subsample_seed=int(self.config.get("split_seed", 42)),
+            # Time-aware labels (defaults preserve the legacy file-level behavior):
+            # label_mode "auto" uses per-window tracks only for manifests that carry
+            # a "sources" field; existing manifests are untouched.
+            label_mode=str(self.config.get("label_mode", "auto")),
+            window_active_frac=float(self.config.get("window_active_frac", 0.5)),
+            skip_inactive_windows=bool(self.config.get("skip_inactive_windows", True)),
         )
 
         self.train_set = None

@@ -164,6 +164,8 @@ REQUIRED_KEYS = {
 }
 
 SUPPORTED_KEYS = {
+    # Documentation-only key (ignored by the pipeline).
+    "_comment",
     # Data/manifest keys.
     "manifest_path",
     "audio_dir",
@@ -186,9 +188,7 @@ SUPPORTED_KEYS = {
     "max_sources",
     "use_posenc",
     "dropout",
-    "share_encoder_weights",
     "stochastic_depth",
-    "use_query_decoder",
     "decoder_layers",
     "decoder_dropout",
     "num_epochs",
@@ -198,16 +198,11 @@ SUPPORTED_KEYS = {
     "reset_optimizer",
     "freeze_n_encoder_layers",
     "freeze_posenc",
-    "count_loss_type",
     "lambda_count",
     "lambda_pos",
-    "pos_loss_type",
     "count_label_smoothing",
-    "count_consistency_weight",
-    "count_consistency_cos_threshold",
-    "count_per_k_weights",
     "thresholded_loss_report",
-    "count_head_hidden",
+    "presence_threshold",
     "checkpoint_monitor",
     "checkpoint_monitor_mode",
     "early_stopping_monitor",
@@ -247,6 +242,9 @@ SUPPORTED_KEYS = {
     "overfit_test_threshold",
     "overfit_test_batch_size",
     "subsample_pct",
+    "label_mode",
+    "window_active_frac",
+    "skip_inactive_windows",
 }
 
 
@@ -292,53 +290,9 @@ def _validate_values(cfg):
         # Transformer requirement: embedding dimension must divide by #heads.
         raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead}).")
 
-    count_loss_type = cfg.get("count_loss_type", "regression")
-    if count_loss_type not in ("regression", "ordinal", "presence"):
-        raise ValueError(
-            "count_loss_type must be 'regression' (scalar SmoothL1), "
-            "'ordinal' (max_sources cumulative BCE heads predicting P(k>=j)), "
-            "or 'presence' (per-slot BCE against Hungarian-matched assignment; "
-            "count derived as sum of active slots)."
-        )
-
     count_label_smoothing = float(cfg.get("count_label_smoothing", 0.0))
     if not (0.0 <= count_label_smoothing < 0.5):
         raise ValueError("count_label_smoothing must be in [0.0, 0.5).")
-    if count_label_smoothing > 0 and count_loss_type not in ("ordinal", "presence"):
-        raise ValueError(
-            "count_label_smoothing > 0 is only meaningful in 'ordinal' or 'presence' mode."
-        )
-
-    count_consistency_weight = float(cfg.get("count_consistency_weight", 0.0))
-    if count_consistency_weight < 0.0:
-        raise ValueError("count_consistency_weight must be >= 0.")
-    if count_consistency_weight > 0 and count_loss_type == "presence":
-        raise ValueError(
-            "count_consistency_weight is undefined in 'presence' mode; the presence head "
-            "does not produce a monotone count-distribution to be smoothed. Set it to 0.0."
-        )
-
-    cc_cos_threshold = float(cfg.get("count_consistency_cos_threshold", 0.5))
-    if not (-1.0 <= cc_cos_threshold <= 1.0):
-        raise ValueError("count_consistency_cos_threshold must be in [-1.0, 1.0].")
-
-    per_k_weights = cfg.get("count_per_k_weights")
-    if per_k_weights is not None:
-        if not isinstance(per_k_weights, (list, tuple)):
-            raise ValueError("count_per_k_weights must be a list of floats or null.")
-        expected_len = int(cfg.get("max_sources", 12)) + 1
-        if len(per_k_weights) != expected_len:
-            raise ValueError(
-                f"count_per_k_weights must have length max_sources + 1 = {expected_len}, "
-                f"got {len(per_k_weights)}."
-            )
-        if any(float(w) < 0.0 for w in per_k_weights):
-            raise ValueError("count_per_k_weights entries must be non-negative.")
-        if count_loss_type != "ordinal":
-            raise ValueError(
-                "count_per_k_weights is only meaningful in 'ordinal' mode; "
-                "presence-mode BCE is naturally balanced by the per-slot mask."
-            )
 
     for monitor_key in ("checkpoint_monitor_mode", "early_stopping_mode"):
         mode_val = cfg.get(monitor_key)
@@ -361,11 +315,6 @@ def _validate_values(cfg):
     if not (0.0 <= stochastic_depth < 1.0):
         raise ValueError("stochastic_depth must be in [0.0, 1.0).")
 
-    use_query_decoder = bool(cfg.get("use_query_decoder", False))
-    if use_query_decoder and count_loss_type != "presence":
-        raise ValueError(
-            "use_query_decoder=True currently supports count_loss_type='presence' only."
-        )
     if int(cfg.get("decoder_layers", 3)) < 1:
         raise ValueError("decoder_layers must be >= 1.")
     decoder_dropout = float(cfg.get("decoder_dropout", 0.1))
@@ -405,14 +354,9 @@ def _build_lit_model(cfg):
     return AmbiDOALightningModule(
         model_kwargs=model_kwargs,
         lr=lr_to_use,
-        count_loss_type=cfg.get("count_loss_type", "regression"),
         lambda_count=float(cfg.get("lambda_count", 0.1)),
         lambda_pos=float(cfg.get("lambda_pos", 2.5)),
-        pos_loss_type=cfg.get("pos_loss_type", "cosine"),
         count_label_smoothing=float(cfg.get("count_label_smoothing", 0.0)),
-        count_consistency_weight=float(cfg.get("count_consistency_weight", 0.0)),
-        count_consistency_cos_threshold=float(cfg.get("count_consistency_cos_threshold", 0.5)),
-        count_per_k_weights=cfg.get("count_per_k_weights"),
         use_scheduler=bool(cfg.get("use_scheduler", True)),
         weight_decay=float(cfg.get("weight_decay", 0.0)),
         warmup_steps=cfg.get("warmup_steps"),
@@ -529,28 +473,21 @@ def _run_overfit_test(cfg, project_root, num_epochs=50, loss_threshold=0.1, batc
     # batch from crossing the overfit threshold. Zero it here so the test
     # measures learnability, not the smoothing floor.
     cfg_run["count_label_smoothing"] = 0.0
-    # Optimization regime for the memorization test (no scheduler/warmup).
-    # BCE-based count heads (ordinal, presence) need logits driven to saturation
-    # (~|3|+) for BCE to approach zero, which at production LR (1e-4) with only
-    # overfit_batches=1 step/epoch would stall base_loss around lambda_count*0.13.
-    # The mean-pool heads tolerate a hot LR (5e-3) and need no clipping. The query
-    # decoder (DETR-style) diverges at 5e-3 (grad-norm blow-up, presence
-    # flip-flopping 0<->max_sources): it needs a gentler LR, gradient clipping,
-    # and more steps to break query symmetry and settle.
-    if bool(cfg_run.get("use_query_decoder", False)):
-        cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 1e-3)
-        cfg_run["grad_clip"] = 1.0
-        num_epochs = max(int(num_epochs), 300)
-        # The decoder fits positions to ~1° quickly, but its presence BCE
-        # saturates slowly (positions ~perfect, count ~4/5 → base_loss plateaus
-        # around 0.3-0.4; a hotter LR only destabilizes the presence head). Relax
-        # the pass threshold so the gate reflects "learned" (low angular +
-        # near-right count) rather than full BCE saturation. A genuinely broken
-        # decoder stays >>1 (cf. the un-clipped hot-LR regime that stalls ~2-3).
-        loss_threshold = max(float(loss_threshold), 0.4)
-    else:
-        cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 5e-3)
-        cfg_run["grad_clip"] = 0.0
+    # Optimization regime for the memorization test (no scheduler/warmup). The
+    # presence BCE needs logits driven to saturation (~|3|+) for BCE to approach
+    # zero, which at production LR with one step/epoch (overfit_batches=1) would
+    # stall. The query decoder (DETR-style) diverges at a hot 5e-3 LR (grad-norm
+    # blow-up, presence flip-flopping 0<->max_sources): it needs a gentler LR,
+    # gradient clipping, and more steps to break query symmetry and settle.
+    cfg_run["lr"] = max(float(cfg_run.get("lr", 5e-4)), 1e-3)
+    cfg_run["grad_clip"] = 1.0
+    num_epochs = max(int(num_epochs), 300)
+    # The decoder fits positions to ~1° quickly, but its presence BCE saturates
+    # slowly (positions ~perfect, count ~4/5 → base_loss plateaus around 0.3-0.4;
+    # a hotter LR only destabilizes the presence head). Relax the pass threshold
+    # so the gate reflects "learned" (low angular + near-right count) rather than
+    # full BCE saturation. A genuinely broken decoder stays >>1.
+    loss_threshold = max(float(loss_threshold), 0.4)
     cfg_run["use_scheduler"] = False
     cfg_run["warmup_steps"] = 0
 

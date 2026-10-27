@@ -97,13 +97,13 @@ def build_model_kwargs(config):
         "dim_feedforward": int(config.get("dim_feedforward", 512)),
         "max_sources": int(config.get("max_sources", 12)),
         "use_posenc": bool(config.get("use_posenc", True)),
+        # Positional-encoding length must cover the window's token count
+        # T = round(window_len_ms * sr / 1000). Derive it so longer windows
+        # (e.g. 400 ms @11025 -> T=4410) don't exceed the pos-enc table and crash.
+        "input_len": int(round(float(config.get("window_len_ms", 250)) * float(config.get("sr", 11025)) / 1000)),
         "dropout": float(config.get("dropout", 0.003)),
-        "share_encoder_weights": bool(config.get("share_encoder_weights", False)),
         "gradient_checkpointing": bool(config.get("gradient_checkpointing", False)),
         "stochastic_depth": float(config.get("stochastic_depth", 0.0)),
-        "count_loss_type": str(config.get("count_loss_type", "regression")),
-        "count_head_hidden": bool(config.get("count_head_hidden", True)),
-        "use_query_decoder": bool(config.get("use_query_decoder", False)),
         "decoder_layers": int(config.get("decoder_layers", 3)),
         "decoder_dropout": float(config.get("decoder_dropout", 0.1)),
     }
@@ -158,6 +158,11 @@ def main():
         "--validate-only",
         action="store_true",
         help="Run only validation on the dataset from --config (no training).",
+    )
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Run only evaluation on the held-out TEST split (requires test_ratio>0). No training.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -250,15 +255,11 @@ def main():
     lit_model = AmbiDOALightningModule(
         model_kwargs=model_kwargs,
         lr=lr_to_use,
-        count_loss_type=config.get("count_loss_type", "regression"),
         lambda_count=float(config.get("lambda_count", 0.1)),
         lambda_pos=float(config.get("lambda_pos", 2.5)),
-        pos_loss_type=config.get("pos_loss_type", "cosine"),
         count_label_smoothing=float(config.get("count_label_smoothing", 0.0)),
-        count_consistency_weight=float(config.get("count_consistency_weight", 0.0)),
-        count_consistency_cos_threshold=float(config.get("count_consistency_cos_threshold", 0.5)),
-        count_per_k_weights=config.get("count_per_k_weights"),
         thresholded_loss_report=bool(config.get("thresholded_loss_report", False)),
+        presence_threshold=float(config.get("presence_threshold", 0.5)),
         use_scheduler=bool(config.get("use_scheduler", True)),
         weight_decay=float(config.get("weight_decay", 0.0)),
         warmup_steps=config.get("warmup_steps"),
@@ -288,16 +289,17 @@ def main():
 
     # 4) Load checkpoint/freeze policy depending on run mode.
     ckpt_path_for_fit = None
-    if args.validate_only:
+    if args.validate_only or args.test_only:
+        mode = "validate" if args.validate_only else "test"
         ckpt_ref = str(args.checkpoint) if args.checkpoint is not None else config.get("finetune_from")
         if not ckpt_ref:
             raise RuntimeError(
-                "--validate-only requires checkpoint weights. "
+                f"--{mode}-only requires checkpoint weights. "
                 "Provide --checkpoint or set finetune_from in config."
             )
         ckpt_path = resolve_ckpt_path(ckpt_ref, project_root=project_root)
         load_pretrained_into(lit_model.model, ckpt_path, strict=False, map_location="cpu")
-        print(f"[VAL] Validation-only mode with checkpoint: {ckpt_path}")
+        print(f"[{mode.upper()}] {mode}-only mode with checkpoint: {ckpt_path}")
     else:
         ckpt_path_for_fit = apply_finetune_and_freeze(lit_model, config, project_root=project_root)
 
@@ -341,7 +343,7 @@ def main():
     else:
         logger = CSVLogger(save_dir=str(logs_dir), name="lightning_logs")
     callbacks = []
-    if not args.validate_only and not dev_mode_active:
+    if not args.validate_only and not args.test_only and not dev_mode_active:
         # 6) Configure checkpointing (best + optional last).
         # Default monitor is val_angular_error_deg (slash-free alias for
         # val/angular_error_deg). The angular error tracks the actual operational
@@ -395,7 +397,7 @@ def main():
     # NOTE: AmbiDOALightningModule uses manual optimization.
     # Lightning does not support automatic gradient accumulation/clipping in this mode.
     # Both are handled explicitly in lit_module.training_step.
-    if not args.validate_only:
+    if not args.validate_only and not args.test_only:
         cfg_grad_clip = float(config.get("grad_clip", 0.0))
         cfg_accumulate = int(config.get("accumulate_grad_batches", 1))
         if cfg_grad_clip > 0:
@@ -432,6 +434,8 @@ def main():
     #                              fast_dev_run kwarg passed to Trainer above).
     if args.validate_only:
         trainer.validate(lit_model, datamodule=data_module)
+    elif args.test_only:
+        trainer.test(lit_model, datamodule=data_module)
     elif overfit_dev_run_active and not fast_dev_run_active:
         print("[OVERFIT] overfit_dev_run is active without fast_dev_run — skipping trainer.fit().")
     else:

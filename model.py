@@ -2,10 +2,7 @@ import copy
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from AmbiDOA import log_print
-from datetime import datetime
 
 
 def _drop_path(x_residual: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
@@ -67,61 +64,30 @@ class SinusoidalPositionalEncoding(nn.Module):
         return x + self.pe[:, :L, :]
 
 
-class _SharedEncoder(nn.Module):
-    """Applies a single TransformerEncoderLayer num_layers times (ALBERT-style weight sharing).
+class _IndependentEncoder(nn.Module):
+    """Stack of independent TransformerEncoderLayers with optional per-layer DropPath
+    (stochastic depth) and optional gradient checkpointing.
 
-    All passes through the stack share identical parameters, reducing memorizable
-    capacity while preserving the depth of iterative refinement.
-
-    use_checkpoint: when True, each pass is wrapped in torch.utils.checkpoint so
-    intermediate activations (including the O(T²) attention matrix) are not stored
-    for backward — they are recomputed on demand. This trades compute for memory
-    and is essential for long sequences or large batch sizes.
-
-    drop_rates: optional list of length num_layers with per-pass DropPath rates.
-    When None (or all zeros), behavior is bit-identical to the unregularized baseline.
-    Drop is applied to the residual contribution (out - x) so layer internals
-    stay untouched.
+    Uses the same `layers` ModuleList as nn.TransformerEncoder, so state dicts are
+    key-compatible across the two. Stochastic depth is applied to each layer's
+    residual contribution via the residual-extraction trick (out - x). When
+    use_checkpoint is True each layer is wrapped in torch.utils.checkpoint so the
+    O(T^2) attention activations are recomputed in backward instead of stored.
     """
 
-    def __init__(self, layer: nn.TransformerEncoderLayer, num_layers: int, use_checkpoint: bool = False, drop_rates=None):
-        super().__init__()
-        self.layer = layer
-        self.num_layers = num_layers
-        self.use_checkpoint = use_checkpoint
-        self.drop_rates = list(drop_rates) if drop_rates is not None else [0.0] * num_layers
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for i in range(self.num_layers):
-            if self.use_checkpoint and self.training:
-                out = checkpoint(self.layer, x, use_reentrant=False)
-            else:
-                out = self.layer(x)
-            dp = self.drop_rates[i]
-            if dp > 0.0:
-                x = x + _drop_path(out - x, dp, self.training)
-            else:
-                x = out
-        return x
-
-
-class _StochasticDepthEncoder(nn.Module):
-    """Stack of independent TransformerEncoderLayers with per-layer DropPath.
-
-    Mirrors nn.TransformerEncoder but applies stochastic depth on each layer's
-    residual contribution via the residual-extraction trick (out - x). Treats the
-    full block (attn + FFN) as one residual unit — coarser than per-sublayer
-    drop but does not require cracking the layer's internals.
-    """
-
-    def __init__(self, encoder_layer: nn.TransformerEncoderLayer, num_layers: int, drop_rates):
+    def __init__(self, encoder_layer: nn.TransformerEncoderLayer, num_layers: int,
+                 drop_rates=None, use_checkpoint: bool = False):
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
-        self.drop_rates = list(drop_rates)
+        self.drop_rates = list(drop_rates) if drop_rates is not None else [0.0] * num_layers
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer, dp in zip(self.layers, self.drop_rates):
-            out = layer(x)
+            if self.use_checkpoint and self.training:
+                out = checkpoint(layer, x, use_reentrant=False)
+            else:
+                out = layer(x)
             if dp > 0.0:
                 x = x + _drop_path(out - x, dp, self.training)
             else:
@@ -131,26 +97,21 @@ class _StochasticDepthEncoder(nn.Module):
 
 class AmbiTransformerDOA(nn.Module):
     """
-    Transformer model for multi-source DOA in Ambisonics:
-      - HEAD 1: source count or per-slot presence. Three modes:
-          * "regression" — scalar SmoothL1 target (one logit).
-          * "ordinal"    — max_sources independent BCE heads predicting P(k>=j).
-          * "presence"   — max_sources per-slot presence logits (BCE against the
-                           PI-matched assignment). Count is derived from the
-                           position head's slot usage, not predicted separately.
-      - HEAD 2 (positions): [max_sources, 3] unit vectors (x, y, z)
+    Transformer model for multi-source DOA in Ambisonics (query-decoder, presence).
 
-    High-level architecture:
-      1) Channel projection (16) -> d_model.
+    Architecture:
+      1) Channel projection (n_channels) -> d_model.
       2) Optional temporal positional encoding.
-      3) Transformer encoder stack.
-      4) Readout — one of two builds (A/B), selected by use_query_decoder:
-           A (default): temporal mean-pool -> pooled count/presence + positions heads.
-           B (presence-only): query decoder — max_sources learned slots cross-attend
-             the encoder output and predict per-slot direction + presence.
+      3) Transformer encoder stack (independent layers, optional stochastic depth
+         and gradient checkpointing).
+      4) Query decoder (DETR-style set prediction): `max_sources` learned slot
+         queries cross-attend the encoder output and self-attend (de-duplicating),
+         each predicting its own unit-vector direction and a presence logit. Count
+         is derived downstream as sum_j 1{sigmoid(presence_j) > threshold}; targets
+         are assigned by permutation-invariant (PI) matching.
 
     Terminology:
-      - d_model: internal feature size in Transformer (not signal length).
+      - d_model: internal feature size in the Transformer (not signal length).
       - nhead: number of attention heads (d_model must be divisible by nhead).
       - num_layers: number of encoder layers.
       - dim_feedforward: MLP size inside each encoder layer.
@@ -167,28 +128,14 @@ class AmbiTransformerDOA(nn.Module):
         dropout: float = 0.3,  # regularization
         max_sources: int = 12,  # maximum number of predicted sources
         use_posenc: bool = True,  # enable positional encoding
-        share_encoder_weights: bool = False,  # ALBERT-style cross-layer weight sharing
         gradient_checkpointing: bool = False,  # recompute activations in backward to save memory
         stochastic_depth: float = 0.0,  # max DropPath rate at the final layer (0 disables)
-        count_loss_type: str = "regression",  # "regression" -> 1 logit; "ordinal" -> max_sources BCE logits; "presence" -> per-slot presence logits
-        count_head_hidden: bool = True,  # False -> single Linear count head (~3K params vs ~70K). Ignored in "presence" mode.
-        use_query_decoder: bool = False,  # A/B readout: False -> mean-pool + pooled heads (baseline); True -> query decoder (presence-only)
-        decoder_layers: int = 3,  # query-decoder depth (only used when use_query_decoder=True)
+        decoder_layers: int = 3,  # query-decoder depth
         decoder_dropout: float = 0.1,  # dropout inside the decoder + slot heads (independent of encoder `dropout`)
     ):
         super().__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
-        if count_loss_type not in ("regression", "ordinal", "presence"):
-            raise ValueError(
-                f"count_loss_type must be 'regression', 'ordinal', or 'presence', got {count_loss_type!r}."
-            )
-        if use_query_decoder and count_loss_type != "presence":
-            raise ValueError(
-                "use_query_decoder=True currently supports count_loss_type='presence' only."
-            )
         self.max_sources = max_sources
-        self.count_loss_type = count_loss_type
-        self.use_query_decoder = use_query_decoder
 
         # Linear decay schedule: layer 0 keeps everything, layer L-1 drops at the
         # configured max rate. p_ℓ = stochastic_depth * ℓ / (L-1). When num_layers
@@ -202,7 +149,7 @@ class AmbiTransformerDOA(nn.Module):
         else:
             drop_rates = None
 
-        # (1) Project channel features 16 -> d_model.
+        # (1) Project channel features (n_channels) -> d_model.
         self.proj = nn.Sequential(
             nn.Linear(n_channels, d_model),
             nn.LayerNorm(d_model),
@@ -225,155 +172,66 @@ class AmbiTransformerDOA(nn.Module):
             norm_first=True,  # Pre-LN
             activation="gelu",
         )
-        if share_encoder_weights:
-            # One set of weights applied num_layers times — reduces memorizable
-            # parameters while preserving iterative refinement depth.
-            self.transformer = _SharedEncoder(
-                enc_layer,
-                num_layers,
-                use_checkpoint=gradient_checkpointing,
-                drop_rates=drop_rates,
+        # Independent-layer encoder when stochastic depth or gradient checkpointing
+        # is needed (both produce `transformer.layers.*` keys, matching the stock
+        # nn.TransformerEncoder used otherwise).
+        if drop_rates is not None or gradient_checkpointing:
+            self.transformer = _IndependentEncoder(
+                enc_layer, num_layers, drop_rates=drop_rates, use_checkpoint=gradient_checkpointing
             )
-        elif drop_rates is not None:
-            self.transformer = _StochasticDepthEncoder(enc_layer, num_layers, drop_rates)
         else:
             self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.pre_head_norm = nn.LayerNorm(d_model)  # normalization before output heads
 
-        # (4)+(5) Readout heads. Two mutually exclusive builds (A/B), selected by
-        # use_query_decoder so a run can be reverted by flipping one config flag:
-        #   A (default): temporal mean-pool feature -> pooled count/presence head
-        #                + pooled positions MLP (all slots from one vector).
-        #   B (presence-only): query decoder -> per-slot direction + presence
-        #                heads (each slot predicts itself).
-        if use_query_decoder:
-            # --- Build B: query-decoder readout (presence-only, validated above). ---
-            # Pooled-path heads are not built in this mode.
-            self.n_sources_head = None
-            self.presence_head = None
-            self.positions_head = None
-            # One learned query embedding per source slot. These carry the slot
-            # identity (DETR-style); no sinusoidal PE is added on the query side
-            # because PI matching makes the slots order-free.
-            self.source_queries = nn.Parameter(torch.randn(max_sources, d_model) * 0.02)
-            # Decoder has its own dropout so it can be tuned independently of the
-            # (typically heavier) encoder dropout.
-            dec_layer = nn.TransformerDecoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=decoder_dropout,
-                batch_first=True,  # [B, S, d_model]
-                norm_first=True,  # Pre-LN, matching the encoder
-                activation="gelu",
-            )
-            self.decoder = nn.TransformerDecoder(dec_layer, num_layers=decoder_layers)
-            # Per-slot heads: each query token predicts its own unit direction and
-            # a single presence logit.
-            self.slot_pos_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Dropout(decoder_dropout),
-                nn.Linear(d_model, 3),
-            )
-            self.slot_presence_head = nn.Linear(d_model, 1)
-        else:
-            # --- Build A: pooled-feature readout (baseline; all count modes). ---
-            self.source_queries = None
-            self.decoder = None
-            self.slot_pos_head = None
-            self.slot_presence_head = None
-
-            # (4) HEAD 1: source count OR per-slot presence.
-            #   - regression: single scalar logit (SmoothL1 target).
-            #   - ordinal: max_sources logits; head j predicts P(k >= j+1) via BCE.
-            #   - presence: max_sources per-slot presence logits (BCE against PI
-            #               assignment). Count is derived downstream as
-            #               sum_j 1{sigmoid(presence_j) > 0.5}.
-            # count_head_hidden=False collapses the 2-layer MLP to a single Linear
-            # (d_model -> count_out_dim), a remedy against count-head memorization
-            # of per-sample k from the pooled feature. Ignored in presence mode.
-            if count_loss_type == "presence":
-                self.n_sources_head = None
-                self.presence_head = nn.Linear(d_model, max_sources)
-            else:
-                count_out_dim = max_sources if count_loss_type == "ordinal" else 1
-                if count_head_hidden:
-                    self.n_sources_head = nn.Sequential(
-                        nn.Linear(d_model, d_model),
-                        nn.GELU(),
-                        nn.Dropout(dropout),
-                        nn.Linear(d_model, count_out_dim),
-                    )
-                else:
-                    self.n_sources_head = nn.Linear(d_model, count_out_dim)
-                self.presence_head = None
-
-            # (5) HEAD 2: source positions (max_sources * 3).
-            self.positions_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model, max_sources * 3),
-            )
+        # (4) Query-decoder readout (presence-only set prediction).
+        # One learned query embedding per source slot; these carry slot identity
+        # (DETR-style), no sinusoidal PE on the query side since PI matching makes
+        # the slots order-free. The decoder has its own dropout so it can be tuned
+        # independently of the (typically heavier) encoder dropout.
+        self.source_queries = nn.Parameter(torch.randn(max_sources, d_model) * 0.02)
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=decoder_dropout,
+            batch_first=True,  # [B, S, d_model]
+            norm_first=True,  # Pre-LN, matching the encoder
+            activation="gelu",
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=decoder_layers)
+        # Per-slot heads: each query token predicts its own unit direction and a
+        # single presence logit.
+        self.slot_pos_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(decoder_dropout),
+            nn.Linear(d_model, 3),
+        )
+        self.slot_presence_head = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor):
         """
         x: [batch, n_channels, n_samples] -> [B, 16, T]
         Returns:
-          head1:     [B, 1] in "regression" mode, [B, max_sources] logits in "ordinal"
-                     mode, [B, max_sources] per-slot presence logits in "presence" mode.
-          positions: [B, max_sources, 3] unit vectors
+          n_sources: [B, max_sources] per-slot presence logits.
+          positions: [B, max_sources, 3] unit vectors.
         """
         # Convert to Transformer layout [B, T, C].
         x = x.permute(0, 2, 1)  # [B, T, C]
 
-        # Project channels to d_model.
+        # Project channels to d_model, add positional encoding, encode.
         x = self.proj(x)  # [B, T, d_model]
-
-        # Add positional encoding.
         x = self.pos_enc(x)  # [B, T, d_model]
+        memory = self.transformer(x)  # [B, T, d_model] (full sequence, no pooling)
 
-        # Transformer encoding (kept as a full sequence — no pooling yet).
-        memory = self.transformer(x)  # [B, T, d_model]
+        # Query decoder: learned slots cross-attend the sequence and self-attend.
+        B = memory.size(0)
+        q = self.source_queries.unsqueeze(0).expand(B, -1, -1)  # [B, S, d_model]
+        slots = self.decoder(tgt=q, memory=memory)  # [B, S, d_model]
+        slots = self.pre_head_norm(slots)  # LayerNorm over feature dim, per slot
 
-        # --- Build B: query-decoder readout (presence-only). ---
-        if self.use_query_decoder:
-            B = memory.size(0)
-            # Broadcast the learned slot queries across the batch.
-            q = self.source_queries.unsqueeze(0).expand(B, -1, -1)  # [B, S, d_model]
-            # Each slot cross-attends the full temporal sequence (and the slots
-            # self-attend, letting them de-duplicate), replacing the mean-pool
-            # single-vector bottleneck.
-            slots = self.decoder(tgt=q, memory=memory)  # [B, S, d_model]
-            slots = self.pre_head_norm(slots)  # LayerNorm over feature dim, per slot
-
-            positions = self.slot_pos_head(slots)  # [B, S, 3]
-            positions = positions / (positions.norm(dim=2, keepdim=True) + 1e-8)
-
-            # Per-slot presence logits: [B, S].
-            n_sources = self.slot_presence_head(slots).squeeze(-1)
-            return n_sources, positions
-
-        # --- Build A: temporal mean-pool + pooled heads (baseline). ---
-        feats = memory.mean(dim=1)  # [B, d_model]
-        feats = self.pre_head_norm(feats)
-
-        # HEAD 1: source count OR per-slot presence. Output shape depends on
-        # count_loss_type:
-        #   "regression" -> [B, 1] scalar logit,
-        #   "ordinal"    -> [B, max_sources] cumulative BCE logits,
-        #   "presence"   -> [B, max_sources] per-slot presence logits.
-        if self.count_loss_type == "presence":
-            n_sources = self.presence_head(feats)
-        else:
-            n_sources = self.n_sources_head(feats)
-
-        # HEAD 2: source positions.
-        positions = self.positions_head(feats)  # [B, S * 3]
-        positions = positions.view(-1, self.max_sources, 3)  # [B, S, 3]
-
-        # Normalize to unit vectors on the sphere.
+        positions = self.slot_pos_head(slots)  # [B, S, 3]
         positions = positions / (positions.norm(dim=2, keepdim=True) + 1e-8)
 
+        n_sources = self.slot_presence_head(slots).squeeze(-1)  # [B, S] presence logits
         return n_sources, positions
