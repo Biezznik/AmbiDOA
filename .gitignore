@@ -66,3 +66,15 @@ COMMIT_MSG.txt
 CHANGES_SINCE_d6bc5b6.md
 CHANGES_PRESENCE_COUNT_HEAD.md
 CHANGES_QUERY_DECODER.md
+rodbuk/data_steward_email_draft.md
+rodbuk/form_values.txt
+rodbuk/make_attribution.py
+rodbuk/make_checksums.py
+rodbuk/make_form_values.py
+rodbuk/README.md
+rodbuk/rodbuk_dataset_metadata.json
+rodbuk/scan_levels.py
+rodbuk/stage_deposit.py
+rodbuk/upload_rodbuk.py
+rodbuk/validate_metadata.py
+rodbuk/verify_deposit.py

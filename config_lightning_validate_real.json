@@ -1,12 +1,12 @@
 {
-  "_comment": "Run-ready VALIDATE-ONLY config for the best decoder model (2026_07_17, val_ang 7.99 deg) on the real dataset. Architecture mirrors the checkpoint exactly (read from the ckpt state_dict). ONLY edit the two FILL_ME paths under 'data'. Run: python lightning/train_lightning.py --config config_lightning_validate_real.json --validate-only",
+  "_comment": "VALIDATE-ONLY test of the current best model (2026_10_13 real fine-tune, EMA) on the held-out Test_Batch_103 set (100 files, same Zylia real domain as the training recordings). File-level manifest (azimuths/mask), so label_mode auto takes the legacy path. sr/window MUST match the checkpoint (8 kHz, 250 ms). Whole set as validation (val_ratio 1.0). Run: python lightning/train_lightning.py --config config_lightning_validate_real.json --validate-only",
   "data": {
-    "manifest_path": "D:\\pm\\bb\\Real_Dataset_Frame_Push\\Real_Dataset_Frame_Push\\103_Whole_Manifest_ACN-SN3D_Real_Dataset.json",
-    "audio_dir": "D:\\pm\\bb\\Real_Dataset_Frame_Push\\Real_Dataset_Frame_Push",
-    "sr": 11025,
-    "window_len_ms": 272,
+    "manifest_path": "D:\\pm\\bb\\Test_Batch_103\\Test_Batch_Manifest_ACN-SN3D_Real_Dataset.json",
+    "audio_dir": "D:\\pm\\bb\\Test_Batch_103",
+    "sr": 8000,
+    "window_len_ms": 250,
     "dbfs_threshold": -80.0,
-    "batch_size": 64,
+    "batch_size": 32,
     "num_workers": 4,
     "train_num_workers": 0,
     "val_num_workers": 4,
@@ -34,7 +34,8 @@
     "lambda_count": 1.5,
     "lambda_pos": 5.0,
     "count_label_smoothing": 0.15,
-    "thresholded_loss_report": true
+    "thresholded_loss_report": true,
+    "presence_threshold": 0.5
   },
   "optimizer": {
     "lr": 0.0001,
@@ -55,7 +56,7 @@
     "regularization_every_n_steps": 1
   },
   "finetune": {
-    "finetune_from": "models/2026_07_17/best_ema_model.pth",
+    "finetune_from": "models/2026_10_13/best_ema_model.pth",
     "finetune_lr": 0.0001,
     "reset_optimizer": true,
     "freeze_n_encoder_layers": 0,

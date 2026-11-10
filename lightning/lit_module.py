@@ -351,6 +351,10 @@ class AmbiDOALightningModule(pl.LightningModule):
         self._val_count_sample_sum = 0
         self._val_pred_count_hist = torch.zeros(size, dtype=torch.long)
         self._val_per_k_samples = torch.zeros(size, dtype=torch.long)
+        # Count-as-class confusion matrix: rows = true count k, cols = predicted
+        # count. Logged at epoch end so future runs can plot it; eval-only and
+        # O(windows) integer scatter, so no measurable overhead.
+        self._val_count_confusion = torch.zeros(size, size, dtype=torch.long)
         self._val_per_k_count_err_sum = torch.zeros(size, dtype=torch.float64)
         self._val_per_k_ang_err_sum = torch.zeros(size, dtype=torch.float64)
         self._val_per_k_ang_cnt_sum = torch.zeros(size, dtype=torch.float64)
@@ -591,6 +595,12 @@ class AmbiDOALightningModule(pl.LightningModule):
 
         k_true = true_count_cpu.round().clamp(0, max_sources).long()
         self._val_per_k_samples += torch.bincount(k_true, minlength=max_sources + 1)
+        # Accumulate the count-as-class confusion matrix (true k -> predicted).
+        self._val_count_confusion.index_put_(
+            (k_true, pred_counts_rounded),
+            torch.ones_like(k_true),
+            accumulate=True,
+        )
         per_k_count_err = torch.zeros(max_sources + 1, dtype=torch.float64)
         per_k_count_err.scatter_add_(0, k_true, count_abs_err_cpu.to(torch.float64))
         self._val_per_k_count_err_sum += per_k_count_err
@@ -683,6 +693,29 @@ class AmbiDOALightningModule(pl.LightningModule):
             self._print_and_append_txt("Per-k:")
             for line in per_k_lines:
                 self._print_and_append_txt(f"   {line}")
+
+        # Count-as-class confusion matrix (rows = true k, cols = predicted count).
+        # Logged in full so future runs can be parsed and plotted; two summary
+        # scalars (exact and within-1 accuracy) also go to the CSV logger.
+        cm = self._val_count_confusion
+        total = int(cm.sum().item())
+        if total > 0:
+            size = max_sources + 1
+            exact_acc = float(torch.diagonal(cm).sum().item()) / total
+            ii, jj = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+            pm1_acc = float((cm * ((ii - jj).abs() <= 1)).sum().item()) / total
+            self.log(f"{stage}/count_acc", exact_acc, prog_bar=False)
+            self.log(f"{stage}/count_acc_pm1", pm1_acc, prog_bar=False)
+            if stage == "val":
+                self.log("val_count_acc", exact_acc)
+                self.log("val_count_acc_pm1", pm1_acc)
+            self._print_and_append_txt(
+                f"CountConfusion (rows=true k, cols=pred 0..{max_sources}) | "
+                f"exact_acc={exact_acc:.3f} | pm1_acc={pm1_acc:.3f}"
+            )
+            for k in range(size):
+                if int(self._val_per_k_samples[k].item()) > 0:
+                    self._print_and_append_txt(f"   t={k}: {cm[k].tolist()}")
 
     def on_validation_epoch_end(self):
         """Compute full-epoch validation metrics and print concise diagnostics."""
